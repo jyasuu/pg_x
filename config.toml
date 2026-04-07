@@ -1,0 +1,13 @@
+default = "local"
+
+[connections.local]
+url = "postgres://postgres:secret@localhost:5432/mydb"
+description = "Local dev database"
+
+[connections.staging]
+url = "postgres://user:pass@staging.host:5432/stagingdb"
+description = "Staging"
+
+[connections.prod]
+url = "postgres://readonly:pass@prod.host:5432/proddb"
+description = "Production (read-only replica)"

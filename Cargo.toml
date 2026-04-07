@@ -1,0 +1,60 @@
+[package]
+name = "pgx"
+version = "0.1.0"
+edition = "2021"
+description = "A feature-rich PostgreSQL CLI tool — beyond psql"
+authors = ["jyasuu"]
+
+[[bin]]
+name = "pgx"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Postgres async driver
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+postgres-types = { version = "0.2", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+# TLS (optional, feature-gated)
+tokio-postgres-rustls = { version = "0.10", optional = true }
+rustls = { version = "0.21", optional = true }
+
+# Excel output
+rust_xlsxwriter = "0.64"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Output / display
+comfy-table = "7"
+indicatif = "0.17"
+console = "0.15"
+colored = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+toml = "0.8"
+url = "2"
+regex = "1"
+csv = "1"
+once_cell = "1"
+
+[features]
+default = []
+tls = ["tokio-postgres-rustls", "rustls"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
