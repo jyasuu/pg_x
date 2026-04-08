@@ -13,10 +13,7 @@ const DATA_ROWS_PER_SHEET: usize = EXCEL_MAX_ROWS - HEADER_ROWS;
 /// Sanitize and clamp Excel worksheet names
 fn sanitize_sheet_name(name: &str) -> String {
     let invalid = [':', '\\', '/', '?', '*', '[', ']'];
-    let mut clean: String = name
-        .chars()
-        .filter(|c| !invalid.contains(c))
-        .collect();
+    let mut clean: String = name.chars().filter(|c| !invalid.contains(c)).collect();
 
     if clean.len() > 31 {
         clean.truncate(31);
@@ -54,8 +51,7 @@ pub fn write_excel(
     let base_sheet_name = sanitize_sheet_name(sheet_name);
 
     let total_rows = rowset.rows.len();
-    let sheet_count =
-        (total_rows + DATA_ROWS_PER_SHEET - 1) / DATA_ROWS_PER_SHEET;
+    let sheet_count = (total_rows + DATA_ROWS_PER_SHEET - 1) / DATA_ROWS_PER_SHEET;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Formats
@@ -115,9 +111,7 @@ pub fn write_excel(
                 Some(&fmt_odd)
             };
 
-            for (col_idx, cell) in
-                row.iter().enumerate().take(EXCEL_MAX_COLS)
-            {
+            for (col_idx, cell) in row.iter().enumerate().take(EXCEL_MAX_COLS) {
                 let col = col_idx as u16;
 
                 // Track column width
@@ -127,12 +121,7 @@ pub fn write_excel(
                 }
 
                 if cell == "NULL" {
-                    ws.write_with_format(
-                        excel_row,
-                        col,
-                        "NULL",
-                        &fmt_null,
-                    )?;
+                    ws.write_with_format(excel_row, col, "NULL", &fmt_null)?;
                 } else if let Ok(n) = cell.parse::<f64>() {
                     if let Some(fmt) = row_fmt {
                         ws.write_number_with_format(excel_row, col, n, fmt)?;
@@ -148,12 +137,7 @@ pub fn write_excel(
                     }
                 } else {
                     if let Some(fmt) = row_fmt {
-                        ws.write_with_format(
-                            excel_row,
-                            col,
-                            cell.as_str(),
-                            fmt,
-                        )?;
+                        ws.write_with_format(excel_row, col, cell.as_str(), fmt)?;
                     } else {
                         ws.write(excel_row, col, cell.as_str())?;
                     }
@@ -188,9 +172,8 @@ pub fn write_excel(
     // ─────────────────────────────────────────────────────────────────────────
     // Save
     // ─────────────────────────────────────────────────────────────────────────
-    wb.save(path).with_context(|| {
-        format!("Cannot save Excel file: {}", path.display())
-    })?;
+    wb.save(path)
+        .with_context(|| format!("Cannot save Excel file: {}", path.display()))?;
 
     Ok(())
 }

@@ -49,9 +49,24 @@ regex = "1"
 csv = "1"
 once_cell = "1"
 
+# Async utilities
+async-trait = "0.1"
+
+# RabbitMQ (AMQP) - feature-gated
+lapin = { version = "2", optional = true }
+
+# HTTP client for webhook - feature-gated
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+# Kafka - feature-gated (requires librdkafka system library)
+rdkafka = { version = "0.36", optional = true }
+
 [features]
-default = []
+default = ["rabbitmq", "webhook"]
 tls = ["tokio-postgres-rustls", "rustls"]
+rabbitmq = ["lapin"]
+kafka = ["rdkafka"]
+webhook = ["reqwest"]
 
 [profile.release]
 opt-level = 3
