@@ -13,14 +13,19 @@ path = "src/main.rs"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# Postgres async driver
+# Postgres async driver (control plane: slot management, wal_level check)
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 postgres-types = { version = "0.2", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
-# TLS (optional, feature-gated)
+# TLS for the control-plane connection (optional)
 tokio-postgres-rustls = { version = "0.10", optional = true }
 rustls = { version = "0.21", optional = true }
+
+# Logical replication protocol (WAL streaming via pgoutput)
+# Handles the full replication wire protocol: auth, keepalives, CopyBoth, etc.
+# tokio-postgres alone does not support the replication connection mode.
+pgwire-replication = { version = "0.2", default-features = false }
 
 # Excel output
 rust_xlsxwriter = "0.64"
@@ -51,6 +56,12 @@ once_cell = "1"
 
 # Async utilities
 async-trait = "0.1"
+
+# Replication frame parsing
+bytes = "1"
+
+# Binary hex encoding (for pgoutput binary column values)
+hex = "0.4"
 
 # RabbitMQ (AMQP) - feature-gated
 lapin = { version = "2", optional = true }

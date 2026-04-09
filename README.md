@@ -298,3 +298,234 @@ pgx -U $DATABASE_URL info --version --databases --tables
 | `webhook`  | ✅      | HTTP webhook downstream via `reqwest` |
 | `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
 | `tls`      | ❌      | TLS support for PostgreSQL connections |
+
+---
+
+## replicate — PostgreSQL Logical Replication (WAL streaming)
+
+The `replicate` command connects using the PostgreSQL **replication protocol**,
+subscribes to a publication via a `pgoutput` logical replication slot, and
+forwards every `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` event — decoded
+from the binary WAL stream — to any downstream sink.
+
+Unlike `listen` (which requires explicit `pg_notify()` calls), `replicate`
+captures every data change automatically, with full before/after row values.
+
+### Comparison: `listen` vs `replicate`
+
+| | `listen` | `replicate` |
+|---|---|---|
+| Source | `pg_notify()` calls | WAL (any INSERT/UPDATE/DELETE) |
+| Payload | Whatever app puts in NOTIFY | Full row images, before + after |
+| Setup | None | `wal_level=logical` + publication |
+| Durability | At-most-once | Exactly-once (replication slot) |
+| Resume | No | Yes (via LSN checkpoint) |
+
+---
+
+### PostgreSQL prerequisites
+
+```sql
+-- In postgresql.conf:
+wal_level = logical
+
+-- Restart PostgreSQL, then create a publication:
+CREATE PUBLICATION my_pub FOR TABLE orders, inventory;
+
+-- Or replicate every table in the database:
+CREATE PUBLICATION my_pub FOR ALL TABLES;
+
+-- The connecting user must have the REPLICATION privilege:
+ALTER USER myuser REPLICATION;
+```
+
+---
+
+### Downstream: stdout (debugging)
+
+```bash
+# Pretty-print all WAL events
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  stdout --pretty
+
+# Filter to INSERT and UPDATE on a specific table
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  --table public.orders \
+  --op insert --op update \
+  stdout --pretty
+```
+
+**Example output:**
+
+```json
+{
+  "op": "insert",
+  "rel_id": 16384,
+  "schema": "public",
+  "table": "orders",
+  "new": {
+    "id": "42",
+    "customer": "Alice",
+    "status": "pending",
+    "total": "99.95"
+  }
+}
+```
+
+---
+
+### Downstream: shell
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  shell \
+  --command 'echo "[$PGX_OP] $PGX_SCHEMA.$PGX_TABLE new=$PGX_NEW"'
+```
+
+**Available environment variables:**
+
+| Variable      | Description |
+|---------------|-------------|
+| `PGX_OP`      | Operation: `insert`, `update`, `delete`, `truncate`, `begin`, `commit`, `relation` |
+| `PGX_SCHEMA`  | Schema name (DML events) |
+| `PGX_TABLE`   | Table name  (DML events) |
+| `PGX_LSN`     | WAL position (e.g. `0/1A2B3C`) |
+| `PGX_XID`     | Transaction ID (BEGIN events) |
+| `PGX_NEW`     | JSON of new row values (INSERT / UPDATE) |
+| `PGX_OLD`     | JSON of old row values (UPDATE / DELETE) |
+| `PGX_PAYLOAD` | Full event JSON |
+
+---
+
+### Downstream: webhook
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  --op insert --op update \
+  webhook \
+  --url https://example.com/hooks/wal \
+  --header "Authorization=Bearer mytoken"
+```
+
+The full event JSON is POSTed as the request body with `Content-Type: application/json`.
+
+---
+
+### Downstream: RabbitMQ
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  rabbitmq \
+  --amqp-url amqp://guest:guest@localhost:5672/%2F \
+  --exchange wal-events \
+  --routing-key pgx.wal
+```
+
+AMQP headers `pgx-op`, `pgx-schema`, `pgx-table`, `pgx-lsn` are injected automatically.
+
+---
+
+### Downstream: Kafka
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  kafka \
+  --brokers localhost:9092 \
+  --topic pgx-wal
+```
+
+The Kafka message key is set to the table name, making it easy to partition events by table.
+
+---
+
+### Slot management flags
+
+| Flag | Description |
+|------|-------------|
+| `--slot <name>` | Slot name (default: `pgx_slot`). Created automatically if absent. |
+| `--reset-slot` | Drop and recreate the slot before starting. Loses acknowledged progress. |
+| `--temporary` | Create a temporary slot — dropped when the session ends. |
+| `--start-lsn <A/BB>` | Resume from a specific WAL position. |
+
+---
+
+### Filtering
+
+```bash
+# Only orders table, only inserts
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot --publication my_pub \
+  --table public.orders \
+  --op insert \
+  stdout
+
+# Include transaction boundaries and schema events
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot --publication my_pub \
+  --emit-txn-boundaries \
+  --emit-schema \
+  stdout --pretty
+```
+
+---
+
+### Architecture: new files
+
+```
+src/
+├── commands/
+│   └── replicate.rs          # CLI args + run() + per-sink WalSink impls
+├── replication/
+│   ├── mod.rs                # module root
+│   ├── event.rs              # WalEvent enum (Begin/Commit/Insert/Update/Delete/…)
+│   ├── decoder.rs            # pgoutput binary → WalEvent parser
+│   └── slot.rs               # ensure_slot / drop_slot / list_slots / parse_lsn
+```
+
+### `WalEvent` JSON schema
+
+All downstream sinks receive events serialised as JSON with an `"op"` discriminant:
+
+```jsonc
+// INSERT
+{ "op": "insert", "rel_id": 16384, "schema": "public", "table": "orders",
+  "new": { "id": "1", "status": "pending" } }
+
+// UPDATE
+{ "op": "update", "rel_id": 16384, "schema": "public", "table": "orders",
+  "old": { "id": "1", "status": "pending" },   // present when REPLICA IDENTITY FULL
+  "new": { "id": "1", "status": "shipped" } }
+
+// DELETE
+{ "op": "delete", "rel_id": 16384, "schema": "public", "table": "orders",
+  "old": { "id": "1", "status": "shipped" } }
+
+// TRUNCATE
+{ "op": "truncate", "rel_ids": [16384], "tables": ["public.orders"],
+  "cascade": false, "restart_seqs": false }
+
+// BEGIN
+{ "op": "begin", "lsn": "0/1A2B3C", "commit_time": 759638400000000, "xid": 742 }
+
+// COMMIT
+{ "op": "commit", "lsn": "0/1A2B40", "end_lsn": "0/1A2B68", "commit_time": 759638400000000 }
+```
+
+> **Tip — get full old-row values on UPDATE/DELETE:**
+> By default PostgreSQL only includes the primary key columns in the old tuple.
+> To get all columns before the change, run:
+> ```sql
+> ALTER TABLE orders REPLICA IDENTITY FULL;
+> ```

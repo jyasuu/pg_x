@@ -1,10 +1,11 @@
 mod commands;
 mod downstream;
+mod replication;
 mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use commands::{export, info, listen, query};
+use commands::{export, info, listen, query, replicate};
 use utils::config::Config;
 
 /// pgx — PostgreSQL power CLI (beyond psql & pg_*)
@@ -43,6 +44,9 @@ enum Commands {
 
     /// Subscribe to PostgreSQL NOTIFY channels and forward events to a downstream sink
     Listen(listen::ListenArgs),
+
+    /// Stream WAL changes via PostgreSQL logical replication (INSERT/UPDATE/DELETE)
+    Replicate(replicate::ReplicateArgs),
 }
 
 #[tokio::main]
@@ -57,6 +61,7 @@ async fn main() -> Result<()> {
         Commands::Query(args) => query::run(url, args).await,
         Commands::Info(args) => info::run(url, args).await,
         Commands::Listen(args) => listen::run(url, args).await,
+        Commands::Replicate(args) => replicate::run(url, args).await,
     }
 }
 
