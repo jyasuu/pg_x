@@ -1,7 +1,8 @@
 //! `pgx replicate` — stream WAL changes via PostgreSQL logical replication.
 //!
 //! Uses the self-contained replication client (src/replication/client.rs) for
-//! [`tokio-postgres`] for the control plane (slot management, wal_level check).
+//! the WAL streaming protocol plane, and tokio-postgres for the control plane
+//! (slot management, wal_level verification).
 //!
 //! ## PostgreSQL prerequisites
 //!

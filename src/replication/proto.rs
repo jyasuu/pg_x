@@ -91,9 +91,9 @@ pub fn current_pg_timestamp() -> i64 {
     unix_micros - PG_EPOCH_MICROS
 }
 
-/// Parse the pgoutput Begin and Commit boundary messages from a raw XLogData payload.
-/// Returns Some(event) only for 'B', 'C', and 'M' message types; None for all others
-/// (Insert, Update, Delete, Relation, etc. which are handled by the outer decoder).
+/// Parse pgoutput Begin and Commit boundary messages from a raw XLogData payload.
+/// Returns Some(boundary) only for 'B' (Begin) and 'C' (Commit); None for all other
+/// message types (Insert, Update, Delete, Relation, etc.), which are handled by the decoder.
 pub fn parse_pgoutput_boundary(data: &Bytes) -> ReplResult<Option<PgOutputBoundary>> {
     if data.is_empty() {
         return Ok(None);

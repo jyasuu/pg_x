@@ -101,16 +101,3 @@ pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
         })
         .collect())
 }
-
-/// Parse a human-supplied LSN string (e.g. "0/1A2B3C") into a u64.
-pub fn parse_lsn(s: &str) -> Result<u64> {
-    let parts: Vec<&str> = s.split('/').collect();
-    if parts.len() != 2 {
-        bail!("Invalid LSN '{}': expected format <hi>/<lo>", s);
-    }
-    let hi = u64::from_str_radix(parts[0], 16)
-        .with_context(|| format!("Invalid LSN high part '{}'", parts[0]))?;
-    let lo = u64::from_str_radix(parts[1], 16)
-        .with_context(|| format!("Invalid LSN low part '{}'", parts[1]))?;
-    Ok((hi << 32) | lo)
-}

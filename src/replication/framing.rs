@@ -11,6 +11,7 @@ pub struct BackendMessage {
     pub payload: Bytes,
 }
 
+#[allow(dead_code)]
 pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> ReplResult<BackendMessage> {
     read_backend_message_into(rd, &mut BytesMut::new()).await
 }
@@ -43,15 +44,6 @@ pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
         tag,
         payload: buf.split().freeze(),
     })
-}
-
-pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> ReplResult<()> {
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&8i32.to_be_bytes());
-    buf[4..8].copy_from_slice(&80877103i32.to_be_bytes());
-    wr.write_all(&buf).await?;
-    wr.flush().await?;
-    Ok(())
 }
 
 pub async fn write_startup_message<W: AsyncWrite + Unpin>(
