@@ -18,7 +18,11 @@ pub struct SlotInfo {
 /// If it does not exist it is created with the `pgoutput` plugin.
 ///
 /// `temporary` — create a temporary slot that is dropped when the session ends.
-pub async fn ensure_slot(client: &Client, slot_name: &str, temporary: bool) -> Result<()> {
+pub async fn ensure_slot(
+    client: &Client,
+    slot_name: &str,
+    temporary: bool,
+) -> Result<()> {
     // Check if the slot already exists.
     let rows = client
         .query(
@@ -43,9 +47,13 @@ pub async fn ensure_slot(client: &Client, slot_name: &str, temporary: bool) -> R
 
     // Create the slot.
     let sql = if temporary {
-        format!("CREATE_REPLICATION_SLOT {slot_name} TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT")
+        format!(
+            "CREATE_REPLICATION_SLOT {slot_name} TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT"
+        )
     } else {
-        format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput NOEXPORT_SNAPSHOT")
+        format!(
+            "CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput NOEXPORT_SNAPSHOT"
+        )
     };
 
     client

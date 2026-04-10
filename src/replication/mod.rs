@@ -1,3 +1,10 @@
+pub mod client;
 pub mod decoder;
+pub mod error;
 pub mod event;
+pub mod framing;
+pub mod lsn;
+pub mod messages;
+pub mod proto;
+pub mod scram;
 pub mod slot;

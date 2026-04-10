@@ -1,5 +1,67 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Column value — three distinct states from pgoutput
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A column value as received from the pgoutput logical replication stream.
+///
+/// PostgreSQL's tuple format distinguishes three states that `Option<String>`
+/// cannot represent unambiguously:
+///
+/// | pgoutput tag | Meaning                                    | Serialises as       |
+/// |--------------|--------------------------------------------|---------------------|
+/// | `'t'`        | Text value (even if the text is "NULL")    | `"some text"`       |
+/// | `'n'`        | SQL NULL                                   | `null`              |
+/// | `'u'`        | Unchanged / not sent (TOAST or non-key)    | `"__pgx_unchanged"` |
+///
+/// The `'u'` case appears in:
+/// - UPDATE old-tuples under `REPLICA IDENTITY DEFAULT/INDEX` for non-key columns
+/// - DELETE old-tuples under `REPLICA IDENTITY DEFAULT` for non-key columns
+///
+/// Run `ALTER TABLE t REPLICA IDENTITY FULL` to receive all column values.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub enum ColVal {
+    /// A text-encoded SQL value (may be any non-null SQL type).
+    Text(String),
+    /// SQL NULL.
+    Null,
+    /// Column not sent by the server (unchanged TOAST or non-replica-identity column).
+    Unchanged,
+}
+
+impl ColVal {
+    /// Returns `true` if the column was not sent by the server.
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, ColVal::Unchanged)
+    }
+
+    /// Returns the text value if present.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            ColVal::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for ColVal {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ColVal::Text(v)  => s.serialize_str(v),
+            ColVal::Null     => s.serialize_none(),
+            // Use a sentinel string so consumers can tell "not sent" from NULL
+            ColVal::Unchanged => s.serialize_str("__pgx_unchanged"),
+        }
+    }
+}
+
+pub type Row = HashMap<String, ColVal>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WAL event enum
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// A decoded WAL event from the pgoutput logical replication protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7,46 +69,33 @@ use std::collections::HashMap;
 pub enum WalEvent {
     /// Marks the start of a transaction.
     Begin {
-        /// The final LSN of the transaction.
         lsn: String,
-        /// The commit timestamp (microseconds since 2000-01-01).
         commit_time: i64,
-        /// Transaction ID.
         xid: u32,
     },
 
     /// Marks the successful commit of a transaction.
     Commit {
-        /// LSN of the commit record.
         lsn: String,
-        /// LSN of the end of the commit record.
         end_lsn: String,
-        /// The commit timestamp (microseconds since 2000-01-01).
         commit_time: i64,
     },
 
-    /// Describes a relation (table) that subsequent DML messages reference.
+    /// Describes a relation (table) — emitted before the first DML on that table.
     Relation {
-        /// Relation OID.
         rel_id: u32,
-        /// Schema name (namespace).
         schema: String,
-        /// Table name.
         table: String,
-        /// Column definitions in ordinal order.
         columns: Vec<ColumnDef>,
     },
 
     /// A row was inserted.
     Insert {
-        /// Relation OID (resolved by the caller using the Relation cache).
         rel_id: u32,
-        /// Schema of the table.
         schema: String,
-        /// Name of the table.
         table: String,
-        /// New row as a column-name → value map.
-        new: HashMap<String, Option<String>>,
+        /// New row — all columns are always `Text` or `Null` for inserts.
+        new: Row,
     },
 
     /// A row was updated.
@@ -54,11 +103,15 @@ pub enum WalEvent {
         rel_id: u32,
         schema: String,
         table: String,
-        /// Old row values (present only when REPLICA IDENTITY is FULL or when
-        /// the update changes a replica-identity column).
-        old: Option<HashMap<String, Option<String>>>,
-        /// New (post-update) row values.
-        new: HashMap<String, Option<String>>,
+        /// Old row values.
+        ///
+        /// - `None` — server sent no old tuple (update did not touch replica-identity cols)
+        /// - `Some(row)` — old values; non-key columns may be `Unchanged` under DEFAULT identity
+        ///
+        /// To always receive full old rows: `ALTER TABLE t REPLICA IDENTITY FULL`
+        old: Option<Row>,
+        /// New (post-update) row — all columns present.
+        new: Row,
     },
 
     /// A row was deleted.
@@ -66,26 +119,26 @@ pub enum WalEvent {
         rel_id: u32,
         schema: String,
         table: String,
-        /// The deleted row (present when REPLICA IDENTITY is FULL or DEFAULT
-        /// and the key columns are known).
-        old: HashMap<String, Option<String>>,
+        /// Old row at time of deletion.
+        ///
+        /// Under `REPLICA IDENTITY DEFAULT` only key columns are `Text`/`Null`;
+        /// all other columns will be `Unchanged`.
+        ///
+        /// To always receive full old rows: `ALTER TABLE t REPLICA IDENTITY FULL`
+        old: Row,
     },
 
     /// One or more tables were truncated.
     Truncate {
-        /// Relation OIDs of truncated tables.
         rel_ids: Vec<u32>,
-        /// Names of truncated tables (schema.table).
         tables: Vec<String>,
         cascade: bool,
         restart_seqs: bool,
     },
 
-    /// A keepalive/heartbeat from the server (not a data change).
+    /// A server keepalive — handled internally, not normally forwarded.
     Keepalive {
-        /// Server WAL end position.
         wal_end: String,
-        /// Whether the server requests an immediate status update reply.
         reply_requested: bool,
     },
 }
@@ -103,21 +156,19 @@ pub struct ColumnDef {
 }
 
 impl WalEvent {
-    /// Return a short human-readable operation label for log output.
     pub fn op_label(&self) -> &'static str {
         match self {
-            WalEvent::Begin { .. } => "BEGIN",
-            WalEvent::Commit { .. } => "COMMIT",
-            WalEvent::Relation { .. } => "RELATION",
-            WalEvent::Insert { .. } => "INSERT",
-            WalEvent::Update { .. } => "UPDATE",
-            WalEvent::Delete { .. } => "DELETE",
-            WalEvent::Truncate { .. } => "TRUNCATE",
+            WalEvent::Begin { .. }     => "BEGIN",
+            WalEvent::Commit { .. }    => "COMMIT",
+            WalEvent::Relation { .. }  => "RELATION",
+            WalEvent::Insert { .. }    => "INSERT",
+            WalEvent::Update { .. }    => "UPDATE",
+            WalEvent::Delete { .. }    => "DELETE",
+            WalEvent::Truncate { .. }  => "TRUNCATE",
             WalEvent::Keepalive { .. } => "KEEPALIVE",
         }
     }
 
-    /// Return the table name if this is a DML event.
     pub fn table_name(&self) -> Option<(&str, &str)> {
         match self {
             WalEvent::Insert { schema, table, .. }
@@ -127,7 +178,6 @@ impl WalEvent {
         }
     }
 
-    /// Serialize to a compact JSON string.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }

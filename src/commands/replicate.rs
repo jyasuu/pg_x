@@ -1,6 +1,6 @@
 //! `pgx replicate` — stream WAL changes via PostgreSQL logical replication.
 //!
-//! Uses [`pgwire-replication`] for the replication protocol plane and
+//! Uses the self-contained replication client (src/replication/client.rs) for
 //! [`tokio-postgres`] for the control plane (slot management, wal_level check).
 //!
 //! ## PostgreSQL prerequisites
@@ -21,14 +21,15 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use colored::Colorize;
-use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
 use crate::replication::{
-    decoder::{decode_copy_data, RelationCache},
+    client::{ReplicationClient, ReplicationConfig, ReplicationEvent},
+    decoder::{decode_pgoutput, RelationCache},
     event::WalEvent,
+    lsn::Lsn,
     slot,
 };
 
@@ -155,11 +156,7 @@ pub struct WebhookArgs {
 #[cfg(feature = "rabbitmq")]
 #[derive(Args)]
 pub struct RabbitmqArgs {
-    #[arg(
-        long,
-        env = "AMQP_URL",
-        default_value = "amqp://guest:guest@localhost:5672/%2F"
-    )]
+    #[arg(long, env = "AMQP_URL", default_value = "amqp://guest:guest@localhost:5672/%2F")]
     pub amqp_url: String,
     #[arg(long, default_value = "pgx")]
     pub exchange: String,
@@ -200,9 +197,7 @@ struct StdoutSink {
 
 #[async_trait::async_trait]
 impl WalSink for StdoutSink {
-    fn name(&self) -> &str {
-        "stdout"
-    }
+    fn name(&self) -> &str { "stdout" }
 
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         if self.pretty {
@@ -225,9 +220,7 @@ struct ShellWalSink {
 
 #[async_trait::async_trait]
 impl WalSink for ShellWalSink {
-    fn name(&self) -> &str {
-        "shell"
-    }
+    fn name(&self) -> &str { "shell" }
 
     async fn send_wal(&self, event_json: &str, extra_env: &HashMap<String, String>) -> Result<()> {
         let mut env = self.base_env.clone();
@@ -243,10 +236,7 @@ impl WalSink for ShellWalSink {
             .context("Failed to spawn shell command")?;
 
         if !status.success() {
-            anyhow::bail!(
-                "Shell command exited with status: {}",
-                status.code().unwrap_or(-1)
-            );
+            anyhow::bail!("Shell command exited with status: {}", status.code().unwrap_or(-1));
         }
         Ok(())
     }
@@ -264,9 +254,7 @@ struct WebhookWalSink {
 #[cfg(feature = "webhook")]
 #[async_trait::async_trait]
 impl WalSink for WebhookWalSink {
-    fn name(&self) -> &str {
-        "webhook"
-    }
+    fn name(&self) -> &str { "webhook" }
 
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
@@ -304,9 +292,7 @@ struct RabbitmqWalSink {
 #[cfg(feature = "rabbitmq")]
 #[async_trait::async_trait]
 impl WalSink for RabbitmqWalSink {
-    fn name(&self) -> &str {
-        "rabbitmq"
-    }
+    fn name(&self) -> &str { "rabbitmq" }
 
     async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
         use lapin::{
@@ -354,17 +340,12 @@ struct KafkaWalSink {
 #[cfg(feature = "kafka")]
 #[async_trait::async_trait]
 impl WalSink for KafkaWalSink {
-    fn name(&self) -> &str {
-        "kafka"
-    }
+    fn name(&self) -> &str { "kafka" }
 
     async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
         use rdkafka::producer::FutureRecord;
 
-        let key = env
-            .get("PGX_TABLE")
-            .map(|s| s.as_str())
-            .unwrap_or("pgx-wal");
+        let key = env.get("PGX_TABLE").map(|s| s.as_str()).unwrap_or("pgx-wal");
         self.producer
             .send(
                 FutureRecord::to(&self.topic).key(key).payload(event_json),
@@ -399,24 +380,18 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
         #[cfg(feature = "rabbitmq")]
         ReplicateDownstreamCommand::Rabbitmq(a) => {
             use lapin::{
-                options::ExchangeDeclareOptions, types::FieldTable, Connection,
-                ConnectionProperties, ExchangeKind,
+                options::ExchangeDeclareOptions, types::FieldTable,
+                Connection, ConnectionProperties, ExchangeKind,
             };
             let conn = Connection::connect(&a.amqp_url, ConnectionProperties::default())
                 .await
                 .context("Failed to connect to RabbitMQ")?;
-            let channel = conn
-                .create_channel()
-                .await
-                .context("Failed to open AMQP channel")?;
+            let channel = conn.create_channel().await.context("Failed to open AMQP channel")?;
             channel
                 .exchange_declare(
                     &a.exchange,
                     ExchangeKind::Topic,
-                    ExchangeDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
+                    ExchangeDeclareOptions { durable: true, ..Default::default() },
                     FieldTable::default(),
                 )
                 .await
@@ -436,10 +411,7 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
                 .set("message.timeout.ms", "5000")
                 .create()
                 .context("Failed to create Kafka producer")?;
-            Ok(Arc::new(KafkaWalSink {
-                producer,
-                topic: a.topic.clone(),
-            }))
+            Ok(Arc::new(KafkaWalSink { producer, topic: a.topic.clone() }))
         }
     }
 }
@@ -449,9 +421,12 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn parse_postgres_url(url: &str) -> Result<(String, u16, String, String, String)> {
-    let parsed = url::Url::parse(url).with_context(|| format!("Invalid database URL: {url}"))?;
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("Invalid database URL: {url}"))?;
 
-    let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
+    let host = parsed.host_str()
+        .unwrap_or("127.0.0.1")
+        .to_string();
     let port = parsed.port().unwrap_or(5432);
     let user = parsed.username().to_string();
     let password = parsed.password().unwrap_or("").to_string();
@@ -465,21 +440,17 @@ fn parse_postgres_url(url: &str) -> Result<(String, u16, String, String, String)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn table_matches(schema: &str, table: &str, filter: &[String]) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
+    if filter.is_empty() { return true; }
     let qualified = format!("{schema}.{table}");
     filter.iter().any(|f| f == table || f == &qualified)
 }
 
 fn op_matches(op: &str, filter: &[OpFilter]) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
+    if filter.is_empty() { return true; }
     filter.iter().any(|f| match f {
-        OpFilter::Insert => op == "insert",
-        OpFilter::Update => op == "update",
-        OpFilter::Delete => op == "delete",
+        OpFilter::Insert   => op == "insert",
+        OpFilter::Update   => op == "update",
+        OpFilter::Delete   => op == "delete",
         OpFilter::Truncate => op == "truncate",
     })
 }
@@ -492,10 +463,11 @@ fn should_forward(event: &WalEvent, args: &ReplicateArgs) -> bool {
             let op = event.op_label().to_lowercase();
             table_matches(schema, table, &args.tables) && op_matches(&op, &args.ops)
         }
-        WalEvent::Truncate { .. } => op_matches("truncate", &args.ops),
-        WalEvent::Begin { .. } | WalEvent::Commit { .. } => args.emit_txn_boundaries,
-        WalEvent::Relation { .. } => args.emit_schema,
-        WalEvent::Keepalive { .. } => false,
+        WalEvent::Truncate { .. }           => op_matches("truncate", &args.ops),
+        WalEvent::Begin { .. }
+        | WalEvent::Commit { .. }           => args.emit_txn_boundaries,
+        WalEvent::Relation { .. }           => args.emit_schema,
+        WalEvent::Keepalive { .. }          => false,
     }
 }
 
@@ -509,45 +481,23 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
     env.insert("PGX_LSN".to_string(), lsn_str.to_string());
 
     match event {
-        WalEvent::Insert {
-            schema, table, new, ..
-        } => {
+        WalEvent::Insert { schema, table, new, .. } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_NEW".to_string(),
-                serde_json::to_string(new).unwrap_or_default(),
-            );
+            env.insert("PGX_NEW".to_string(), serde_json::to_string(new).unwrap_or_default());
         }
-        WalEvent::Update {
-            schema,
-            table,
-            new,
-            old,
-            ..
-        } => {
+        WalEvent::Update { schema, table, new, old, .. } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_NEW".to_string(),
-                serde_json::to_string(new).unwrap_or_default(),
-            );
+            env.insert("PGX_NEW".to_string(), serde_json::to_string(new).unwrap_or_default());
             if let Some(o) = old {
-                env.insert(
-                    "PGX_OLD".to_string(),
-                    serde_json::to_string(o).unwrap_or_default(),
-                );
+                env.insert("PGX_OLD".to_string(), serde_json::to_string(o).unwrap_or_default());
             }
         }
-        WalEvent::Delete {
-            schema, table, old, ..
-        } => {
+        WalEvent::Delete { schema, table, old, .. } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_OLD".to_string(),
-                serde_json::to_string(old).unwrap_or_default(),
-            );
+            env.insert("PGX_OLD".to_string(), serde_json::to_string(old).unwrap_or_default());
         }
         WalEvent::Truncate { tables, .. } => {
             env.insert("PGX_TABLES".to_string(), tables.join(","));
@@ -566,52 +516,25 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
 
 fn log_event(event: &WalEvent, lsn_str: &str) {
     match event {
-        WalEvent::Insert { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "INSERT".green(),
-            schema,
-            table.yellow(),
-            lsn_str
-        ),
-        WalEvent::Update { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "UPDATE".yellow(),
-            schema,
-            table.yellow(),
-            lsn_str
-        ),
-        WalEvent::Delete { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "DELETE".red(),
-            schema,
-            table.yellow(),
-            lsn_str
-        ),
-        WalEvent::Truncate { tables, .. } => println!(
-            "{} [{}] {} @ {}",
-            "◀".blue(),
-            "TRUNCATE".red(),
-            tables.join(", ").yellow(),
-            lsn_str
-        ),
-        WalEvent::Begin { xid, .. } => println!("{} [{}] xid={xid}", "◀".blue(), "BEGIN".dimmed()),
-        WalEvent::Commit { .. } => println!("{} [{}] @ {}", "◀".blue(), "COMMIT".dimmed(), lsn_str),
-        WalEvent::Relation {
-            schema,
-            table,
-            columns,
-            ..
-        } => println!(
-            "{} [{}] {}.{} ({} cols)",
-            "◀".blue(),
-            "RELATION".cyan(),
-            schema,
-            table.cyan(),
-            columns.len()
-        ),
+        WalEvent::Insert { schema, table, .. } =>
+            println!("{} [{}] {}.{} @ {}", "◀".blue(), "INSERT".green(),
+                     schema, table.yellow(), lsn_str),
+        WalEvent::Update { schema, table, .. } =>
+            println!("{} [{}] {}.{} @ {}", "◀".blue(), "UPDATE".yellow(),
+                     schema, table.yellow(), lsn_str),
+        WalEvent::Delete { schema, table, .. } =>
+            println!("{} [{}] {}.{} @ {}", "◀".blue(), "DELETE".red(),
+                     schema, table.yellow(), lsn_str),
+        WalEvent::Truncate { tables, .. } =>
+            println!("{} [{}] {} @ {}", "◀".blue(), "TRUNCATE".red(),
+                     tables.join(", ").yellow(), lsn_str),
+        WalEvent::Begin { xid, .. } =>
+            println!("{} [{}] xid={xid}", "◀".blue(), "BEGIN".dimmed()),
+        WalEvent::Commit { .. } =>
+            println!("{} [{}] @ {}", "◀".blue(), "COMMIT".dimmed(), lsn_str),
+        WalEvent::Relation { schema, table, columns, .. } =>
+            println!("{} [{}] {}.{} ({} cols)", "◀".blue(), "RELATION".cyan(),
+                     schema, table.cyan(), columns.len()),
         WalEvent::Keepalive { .. } => {}
     }
 }
@@ -628,11 +551,8 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
 
     // ── 2. Control-plane connection (tokio-postgres, normal SQL) ──────────────
     // Used only for slot management and wal_level verification.
-    // pgwire-replication handles the replication plane separately.
-    println!(
-        "{} Connecting to PostgreSQL…",
-        "pgx-replicate".cyan().bold()
-    );
+    // Our inlined replication client handles the replication plane.
+    println!("{} Connecting to PostgreSQL…", "pgx-replicate".cyan().bold());
 
     let (mgmt_client, mgmt_conn) = tokio_postgres::connect(&base_url, NoTls)
         .await
@@ -658,26 +578,21 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
 
     // Slot lifecycle
     if args.reset_slot {
-        println!(
-            "{} Dropping slot '{}' (--reset-slot)…",
-            "⚠".yellow(),
-            args.slot
-        );
+        println!("{} Dropping slot '{}' (--reset-slot)…", "⚠".yellow(), args.slot);
         slot::drop_slot(&mgmt_client, &args.slot).await?;
     }
     slot::ensure_slot(&mgmt_client, &args.slot, args.temporary).await?;
     println!("{} Slot '{}' ready.", "▶".green(), args.slot.yellow());
 
     // ── 3. Build ReplicationConfig ────────────────────────────────────────────
-    // pgwire-replication only takes one publication per config, so we join
+    // ReplicationConfig takes one publication string, so we join
     // multiple publications as a comma-separated string. PostgreSQL's
     // publication_names option accepts this format.
     let pub_names = args.publications.join(", ");
 
     let start_lsn = match &args.start_lsn {
-        Some(s) => {
-            Lsn::parse(s).map_err(|e| anyhow::anyhow!("Invalid start LSN '{}': {}", s, e))?
-        }
+        Some(s) => Lsn::parse(s)
+            .map_err(|e| anyhow::anyhow!("Invalid start LSN '{}': {}", s, e))?,
         None => Lsn::ZERO, // server picks up from slot's confirmed_flush_lsn
     };
 
@@ -687,25 +602,20 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
         user,
         password,
         database,
-        tls: TlsConfig::disabled(),
         slot: args.slot.clone(),
         publication: pub_names.clone(),
         start_lsn,
-        stop_at_lsn: None,
         ..Default::default()
     };
 
     // ── 4. Open replication stream ────────────────────────────────────────────
     println!(
         "{} Starting replication from {} (publications: {})…",
-        "▶".green(),
-        start_lsn.to_string().yellow(),
-        pub_names.cyan()
+        "▶".green(), start_lsn.to_string().yellow(), pub_names.cyan()
     );
     println!(
         "{} Forwarding to '{}' — Ctrl-C to stop.",
-        "▶".green(),
-        sink.name().cyan()
+        "▶".green(), sink.name().cyan()
     );
 
     let mut repl_client = ReplicationClient::connect(repl_cfg)
@@ -727,131 +637,71 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
             }
 
             Ok(Some(ev)) => match ev {
-                // ── Server keepalive — acknowledged automatically by the worker.
-                // We call update_applied_lsn so the worker sends proper feedback.
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                // ── Keepalive: acknowledge so server can reclaim WAL segments ─
+                ReplicationEvent::KeepAlive { wal_end } => {
                     repl_client.update_applied_lsn(wal_end);
                 }
 
-                // ── Stop condition reached (only relevant if stop_at_lsn set) ─
-                ReplicationEvent::StoppedAt { reached } => {
-                    println!(
-                        "{} Reached stop LSN {}.",
-                        "▶".green(),
-                        reached.to_string().yellow()
-                    );
-                    break;
-                }
-
-                // ── Transaction boundary events ───────────────────────────────
-                // The worker already parses Begin/Commit from the pgoutput stream
-                // and surfaces them as typed events. We forward them if requested.
-                ReplicationEvent::Begin {
-                    final_lsn,
-                    xid,
-                    commit_time_micros,
-                } => {
-                    let event = WalEvent::Begin {
-                        lsn: final_lsn.to_string(),
-                        commit_time: commit_time_micros,
-                        xid,
-                    };
+                // ── Transaction boundaries (Begin / Commit) ───────────────────
+                // The worker parses these from the pgoutput stream and surfaces
+                // them as typed events. Forward to the sink when requested.
+                ReplicationEvent::Begin { final_lsn, xid, commit_time } => {
+                    repl_client.update_applied_lsn(final_lsn);
                     if args.emit_txn_boundaries {
+                        let event = WalEvent::Begin {
+                            lsn: final_lsn.to_string(),
+                            commit_time,
+                            xid,
+                        };
                         log_event(&event, &final_lsn.to_string());
                         let env = event_env(&event, &final_lsn.to_string());
-                        let json = event.to_json();
-                        if let Err(e) = sink.send_wal(&json, &env).await {
+                        if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
                             eprintln!("{} downstream error: {e:#}", "✗".red());
                         }
                     }
                 }
 
-                ReplicationEvent::Commit {
-                    lsn,
-                    end_lsn,
-                    commit_time_micros,
-                } => {
-                    // Advance the acknowledged LSN to allow WAL cleanup on the server
+                ReplicationEvent::Commit { lsn, end_lsn, commit_time } => {
                     repl_client.update_applied_lsn(end_lsn);
-
                     if args.emit_txn_boundaries {
                         let event = WalEvent::Commit {
                             lsn: lsn.to_string(),
                             end_lsn: end_lsn.to_string(),
-                            commit_time: commit_time_micros,
+                            commit_time,
                         };
                         log_event(&event, &end_lsn.to_string());
                         let env = event_env(&event, &end_lsn.to_string());
-                        let json = event.to_json();
-                        if let Err(e) = sink.send_wal(&json, &env).await {
+                        if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
                             eprintln!("{} downstream error: {e:#}", "✗".red());
                         }
                     }
                 }
 
-                // ── pg_logical_emit_message() — not forwarded by default ──────
-                ReplicationEvent::Message {
-                    prefix,
-                    content,
-                    lsn,
-                    ..
-                } => {
-                    eprintln!(
-                        "{} logical message prefix='{}' len={} lsn={}",
-                        "·".dimmed(),
-                        prefix,
-                        content.len(),
-                        lsn
-                    );
-                }
-
-                // ── XLogData: raw pgoutput bytes — decode and forward ──────────
+                // ── XLogData: raw pgoutput bytes (Insert/Update/Delete/etc.) ──
+                // The inlined client gives us the raw pgoutput payload directly;
+                // pass it straight to our binary decoder — no frame wrapping needed.
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
-                    // Advance acknowledged LSN on every WAL frame so the server
-                    // can reclaim WAL segments.
                     repl_client.update_applied_lsn(wal_end);
-
                     let lsn_str = wal_end.to_string();
 
-                    // Wrap in a fake 'w' XLogData CopyData frame header so our
-                    // existing decoder can parse it unchanged.
-                    // Frame layout: 'w'(1) + wal_start(8) + wal_end(8) + ts(8) + payload
-                    let mut frame = Vec::with_capacity(1 + 8 + 8 + 8 + data.len());
-                    frame.push(b'w');
-                    frame.extend_from_slice(&wal_end.as_u64().to_be_bytes()); // wal_start ≈ wal_end
-                    frame.extend_from_slice(&wal_end.as_u64().to_be_bytes());
-                    frame.extend_from_slice(&0i64.to_be_bytes()); // send_time placeholder
-                    frame.extend_from_slice(&data);
-
-                    match decode_copy_data(&frame, &mut rel_cache) {
-                        Ok(Some((event, _))) => {
+                    match decode_pgoutput(&data, &mut rel_cache) {
+                        Ok(Some(event)) => {
                             log_event(&event, &lsn_str);
-
                             if should_forward(&event, &args) {
                                 let env = event_env(&event, &lsn_str);
-                                let json = event.to_json();
-                                if let Err(e) = sink.send_wal(&json, &env).await {
-                                    eprintln!(
-                                        "{} downstream '{}' error: {e:#}",
-                                        "✗".red(),
-                                        sink.name()
-                                    );
+                                if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
+                                    eprintln!("{} downstream '{}' error: {e:#}", "✗".red(), sink.name());
                                 }
                             }
                         }
-                        Ok(None) => {} // skipped message type (Origin, Type…)
-                        Err(e) => {
-                            eprintln!("{} WAL decode error: {e:#}", "✗".red());
-                        }
+                        Ok(None) => {} // Origin, Type, or other skipped message
+                        Err(e) => eprintln!("{} WAL decode error: {e:#}", "✗".red()),
                     }
                 }
             },
         }
     }
 
-    println!(
-        "{} Replication stream closed.",
-        "pgx-replicate".cyan().bold()
-    );
+    println!("{} Replication stream closed.", "pgx-replicate".cyan().bold());
     Ok(())
 }

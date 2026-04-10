@@ -22,11 +22,6 @@ tokio = { version = "1", features = ["full"] }
 tokio-postgres-rustls = { version = "0.10", optional = true }
 rustls = { version = "0.21", optional = true }
 
-# Logical replication protocol (WAL streaming via pgoutput)
-# Handles the full replication wire protocol: auth, keepalives, CopyBoth, etc.
-# tokio-postgres alone does not support the replication connection mode.
-pgwire-replication = { version = "0.2", default-features = false }
-
 # Excel output
 rust_xlsxwriter = "0.64"
 
@@ -57,11 +52,14 @@ once_cell = "1"
 # Async utilities
 async-trait = "0.1"
 
-# Replication frame parsing
+# Replication frame parsing and SCRAM auth
+# (used by our inlined replication client in src/replication/)
 bytes = "1"
-
-# Binary hex encoding (for pgoutput binary column values)
 hex = "0.4"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.9"
 
 # RabbitMQ (AMQP) - feature-gated
 lapin = { version = "2", optional = true }
