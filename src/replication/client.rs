@@ -79,11 +79,23 @@ pub enum ReplicationEvent {
     /// Server keepalive (already acknowledged internally).
     KeepAlive { wal_end: Lsn },
     /// Start of a transaction.
-    Begin { final_lsn: Lsn, xid: u32, commit_time: i64 },
+    Begin {
+        final_lsn: Lsn,
+        xid: u32,
+        commit_time: i64,
+    },
     /// Raw WAL data (pgoutput bytes for Insert/Update/Delete/Relation/etc.).
-    XLogData { wal_start: Lsn, wal_end: Lsn, data: bytes::Bytes },
+    XLogData {
+        wal_start: Lsn,
+        wal_end: Lsn,
+        data: bytes::Bytes,
+    },
     /// End of a transaction.
-    Commit { lsn: Lsn, end_lsn: Lsn, commit_time: i64 },
+    Commit {
+        lsn: Lsn,
+        end_lsn: Lsn,
+        commit_time: i64,
+    },
 }
 
 pub type ReplicationEventReceiver = mpsc::Receiver<ReplResult<ReplicationEvent>>;
@@ -98,7 +110,9 @@ pub struct SharedProgress {
 
 impl SharedProgress {
     fn new(start: Lsn) -> Self {
-        Self { applied: AtomicU64::new(start.as_u64()) }
+        Self {
+            applied: AtomicU64::new(start.as_u64()),
+        }
     }
 
     pub fn load_applied(&self) -> Lsn {
@@ -110,7 +124,10 @@ impl SharedProgress {
         let new = lsn.as_u64();
         let mut cur = self.applied.load(Ordering::Relaxed);
         while new > cur {
-            match self.applied.compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed) {
+            match self
+                .applied
+                .compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }
@@ -144,7 +161,12 @@ impl ReplicationClient {
             worker.run().await
         });
 
-        Ok(Self { rx, progress, stop_tx, join: Some(join) })
+        Ok(Self {
+            rx,
+            progress,
+            stop_tx,
+            join: Some(join),
+        })
     }
 
     /// Receive the next event.
@@ -192,7 +214,11 @@ impl Drop for ReplicationClient {
         let _ = self.stop_tx.send(true);
         if let Some(join) = self.join.take() {
             match tokio::runtime::Handle::try_current() {
-                Ok(h) => { h.spawn(async move { let _ = join.await; }); }
+                Ok(h) => {
+                    h.spawn(async move {
+                        let _ = join.await;
+                    });
+                }
                 Err(_) => join.abort(),
             }
         }
@@ -217,7 +243,12 @@ impl Worker {
         stop_rx: watch::Receiver<bool>,
         out: mpsc::Sender<ReplResult<ReplicationEvent>>,
     ) -> Self {
-        Self { cfg, progress, stop_rx, out }
+        Self {
+            cfg,
+            progress,
+            stop_rx,
+            out,
+        }
     }
 
     async fn run(&mut self) -> ReplResult<()> {
@@ -241,13 +272,18 @@ impl Worker {
     // ── Startup ───────────────────────────────────────────────────────────────
 
     async fn startup<S: AsyncWrite + Unpin>(&self, s: &mut S) -> ReplResult<()> {
-        write_startup_message(s, 196608, &[
-            ("user",             self.cfg.user.as_str()),
-            ("database",         self.cfg.database.as_str()),
-            ("replication",      "database"),
-            ("client_encoding",  "UTF8"),
-            ("application_name", "pgx-replicate"),
-        ]).await
+        write_startup_message(
+            s,
+            196608,
+            &[
+                ("user", self.cfg.user.as_str()),
+                ("database", self.cfg.database.as_str()),
+                ("replication", "database"),
+                ("client_encoding", "UTF8"),
+                ("application_name", "pgx-replicate"),
+            ],
+        )
+        .await
     }
 
     // ── Authentication ────────────────────────────────────────────────────────
@@ -385,7 +421,7 @@ impl Worker {
         stream: &mut BufReader<S>,
     ) -> ReplResult<()> {
         let status_interval = std::time::Duration::from_secs(self.cfg.status_interval_secs);
-        let idle_wakeup     = std::time::Duration::from_secs(self.cfg.idle_wakeup_secs);
+        let idle_wakeup = std::time::Duration::from_secs(self.cfg.idle_wakeup_secs);
 
         let mut last_status = Instant::now() - status_interval;
         let mut last_applied = self.progress.load_applied();
@@ -413,7 +449,15 @@ impl Worker {
                 drained += 1;
                 match msg.tag {
                     b'd' => {
-                        if self.handle_copy_data(stream, msg.payload, &mut last_applied, &mut last_status).await? {
+                        if self
+                            .handle_copy_data(
+                                stream,
+                                msg.payload,
+                                &mut last_applied,
+                                &mut last_status,
+                            )
+                            .await?
+                        {
                             return Ok(());
                         }
                     }
@@ -462,7 +506,10 @@ impl Worker {
 
             match msg.tag {
                 b'd' => {
-                    if self.handle_copy_data(stream, msg.payload, &mut last_applied, &mut last_status).await? {
+                    if self
+                        .handle_copy_data(stream, msg.payload, &mut last_applied, &mut last_status)
+                        .await?
+                    {
                         return Ok(());
                     }
                 }
@@ -482,7 +529,11 @@ impl Worker {
     ) -> ReplResult<bool> {
         let cd = parse_copy_data(payload)?;
         match cd {
-            ReplicationCopyData::KeepAlive { wal_end, reply_requested, .. } => {
+            ReplicationCopyData::KeepAlive {
+                wal_end,
+                reply_requested,
+                ..
+            } => {
                 if reply_requested {
                     let applied = self.progress.load_applied();
                     *last_applied = applied;
@@ -493,16 +544,39 @@ impl Worker {
                 Ok(false)
             }
 
-            ReplicationCopyData::XLogData { wal_start, wal_end, data, .. } => {
+            ReplicationCopyData::XLogData {
+                wal_start,
+                wal_end,
+                data,
+                ..
+            } => {
                 // Check if this is a Begin or Commit boundary message —
                 // the worker surfaces those as typed events for convenience.
                 if let Some(boundary) = parse_pgoutput_boundary(&data)? {
                     match boundary {
-                        PgOutputBoundary::Begin { final_lsn, xid, commit_time } => {
-                            self.emit(Ok(ReplicationEvent::Begin { final_lsn, xid, commit_time })).await;
+                        PgOutputBoundary::Begin {
+                            final_lsn,
+                            xid,
+                            commit_time,
+                        } => {
+                            self.emit(Ok(ReplicationEvent::Begin {
+                                final_lsn,
+                                xid,
+                                commit_time,
+                            }))
+                            .await;
                         }
-                        PgOutputBoundary::Commit { lsn, end_lsn, commit_time } => {
-                            self.emit(Ok(ReplicationEvent::Commit { lsn, end_lsn, commit_time })).await;
+                        PgOutputBoundary::Commit {
+                            lsn,
+                            end_lsn,
+                            commit_time,
+                        } => {
+                            self.emit(Ok(ReplicationEvent::Commit {
+                                lsn,
+                                end_lsn,
+                                commit_time,
+                            }))
+                            .await;
                         }
                     }
                     return Ok(false);
@@ -510,7 +584,12 @@ impl Worker {
 
                 // All other XLogData (Insert, Update, Delete, Relation, etc.)
                 // are forwarded as raw bytes for the pgoutput decoder in replicate.rs.
-                self.emit(Ok(ReplicationEvent::XLogData { wal_start, wal_end, data })).await;
+                self.emit(Ok(ReplicationEvent::XLogData {
+                    wal_start,
+                    wal_end,
+                    data,
+                }))
+                .await;
                 Ok(false)
             }
         }

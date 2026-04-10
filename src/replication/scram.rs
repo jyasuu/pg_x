@@ -21,7 +21,11 @@ impl ScramClient {
         let user = sasl_escape(username);
         let client_first_bare = format!("n={user},r={nonce_b64}");
         let client_first = format!("n,,{client_first_bare}");
-        Self { client_nonce_b64: nonce_b64, client_first_bare, client_first }
+        Self {
+            client_nonce_b64: nonce_b64,
+            client_first_bare,
+            client_first,
+        }
     }
 
     pub fn client_final(
@@ -34,12 +38,16 @@ impl ScramClient {
         if !rnonce.starts_with(&self.client_nonce_b64) {
             return Err(ReplError::Auth("SCRAM nonce mismatch".into()));
         }
-        let salt = B64.decode(salt_b64.as_bytes())
+        let salt = B64
+            .decode(salt_b64.as_bytes())
             .map_err(|e| ReplError::Auth(format!("SCRAM invalid salt base64: {e}")))?;
 
         let channel_binding = "biws"; // base64("n,,")
         let client_final_wo_proof = format!("c={channel_binding},r={rnonce}");
-        let auth_message = format!("{},{},{}", self.client_first_bare, server_first, client_final_wo_proof);
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, server_first, client_final_wo_proof
+        );
 
         let salted_password = hi_sha256(password.as_bytes(), &salt, iters);
         let client_key = hmac_sha256(&salted_password, b"Client Key");
@@ -60,18 +68,24 @@ impl ScramClient {
         if let Some(err) = server_final.split(',').find_map(|p| p.strip_prefix("e=")) {
             return Err(ReplError::Auth(format!("SCRAM server error: {err}")));
         }
-        let v = server_final.split(',')
+        let v = server_final
+            .split(',')
             .find_map(|p| p.strip_prefix("v="))
             .ok_or_else(|| ReplError::Auth("SCRAM missing server signature".into()))?;
 
-        let server_sig = B64.decode(v.trim().as_bytes())
+        let server_sig = B64
+            .decode(v.trim().as_bytes())
             .map_err(|e| ReplError::Auth(format!("SCRAM invalid signature base64: {e}")))?;
 
         let server_key = hmac_sha256(salted_password, b"Server Key");
         let expected = hmac_sha256(&server_key, auth_message.as_bytes());
 
         let ok = server_sig.len() == expected.len()
-            && server_sig.iter().zip(&expected).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
+            && server_sig
+                .iter()
+                .zip(&expected)
+                .fold(0u8, |a, (x, y)| a | (x ^ y))
+                == 0;
 
         if !ok {
             return Err(ReplError::Auth("SCRAM signature mismatch".into()));
@@ -81,11 +95,17 @@ impl ScramClient {
 }
 
 fn parse_server_first(s: &str) -> ReplResult<(String, String, u32)> {
-    let mut r = None; let mut salt = None; let mut iters = None;
+    let mut r = None;
+    let mut salt = None;
+    let mut iters = None;
     for part in s.split(',') {
-        if let Some(v) = part.strip_prefix("r=") { r = Some(v.to_string()); }
-        else if let Some(v) = part.strip_prefix("s=") { salt = Some(v.to_string()); }
-        else if let Some(v) = part.strip_prefix("i=") { iters = v.parse::<u32>().ok(); }
+        if let Some(v) = part.strip_prefix("r=") {
+            r = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("s=") {
+            salt = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("i=") {
+            iters = v.parse::<u32>().ok();
+        }
     }
     Ok((
         r.ok_or_else(|| ReplError::Auth("SCRAM: missing nonce (r=)".into()))?,
@@ -106,7 +126,9 @@ fn hi_sha256(password: &[u8], salt: &[u8], iters: u32) -> Vec<u8> {
     let mut out = u.clone();
     for _ in 1..iters {
         u = hmac_sha256(password, &u);
-        for (o, ui) in out.iter_mut().zip(u.iter()) { *o ^= *ui; }
+        for (o, ui) in out.iter_mut().zip(u.iter()) {
+            *o ^= *ui;
+        }
     }
     out
 }

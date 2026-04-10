@@ -49,8 +49,8 @@ impl ColVal {
 impl Serialize for ColVal {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
-            ColVal::Text(v)  => s.serialize_str(v),
-            ColVal::Null     => s.serialize_none(),
+            ColVal::Text(v) => s.serialize_str(v),
+            ColVal::Null => s.serialize_none(),
             // Use a sentinel string so consumers can tell "not sent" from NULL
             ColVal::Unchanged => s.serialize_str("__pgx_unchanged"),
         }
@@ -158,13 +158,13 @@ pub struct ColumnDef {
 impl WalEvent {
     pub fn op_label(&self) -> &'static str {
         match self {
-            WalEvent::Begin { .. }     => "BEGIN",
-            WalEvent::Commit { .. }    => "COMMIT",
-            WalEvent::Relation { .. }  => "RELATION",
-            WalEvent::Insert { .. }    => "INSERT",
-            WalEvent::Update { .. }    => "UPDATE",
-            WalEvent::Delete { .. }    => "DELETE",
-            WalEvent::Truncate { .. }  => "TRUNCATE",
+            WalEvent::Begin { .. } => "BEGIN",
+            WalEvent::Commit { .. } => "COMMIT",
+            WalEvent::Relation { .. } => "RELATION",
+            WalEvent::Insert { .. } => "INSERT",
+            WalEvent::Update { .. } => "UPDATE",
+            WalEvent::Delete { .. } => "DELETE",
+            WalEvent::Truncate { .. } => "TRUNCATE",
             WalEvent::Keepalive { .. } => "KEEPALIVE",
         }
     }

@@ -25,17 +25,24 @@ pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     let len = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
 
     if len < 4 {
-        return Err(ReplError::Protocol(format!("invalid message length: {len}")));
+        return Err(ReplError::Protocol(format!(
+            "invalid message length: {len}"
+        )));
     }
     let payload_len = (len - 4) as usize;
     if payload_len > MAX_MESSAGE_SIZE {
-        return Err(ReplError::Protocol(format!("message too large: {payload_len}")));
+        return Err(ReplError::Protocol(format!(
+            "message too large: {payload_len}"
+        )));
     }
 
     buf.clear();
     buf.resize(payload_len, 0);
     rd.read_exact(&mut buf[..]).await?;
-    Ok(BackendMessage { tag, payload: buf.split().freeze() })
+    Ok(BackendMessage {
+        tag,
+        payload: buf.split().freeze(),
+    })
 }
 
 pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> ReplResult<()> {
@@ -56,8 +63,10 @@ pub async fn write_startup_message<W: AsyncWrite + Unpin>(
     buf.put_i32(0);
     buf.put_i32(protocol_version);
     for (k, v) in params {
-        buf.extend_from_slice(k.as_bytes()); buf.put_u8(0);
-        buf.extend_from_slice(v.as_bytes()); buf.put_u8(0);
+        buf.extend_from_slice(k.as_bytes());
+        buf.put_u8(0);
+        buf.extend_from_slice(v.as_bytes());
+        buf.put_u8(0);
     }
     buf.put_u8(0);
     let len = buf.len() as i32;
