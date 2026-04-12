@@ -27,6 +27,16 @@ struct Cli {
     #[arg(short = 'c', long = "conn", global = true)]
     connection: Option<String>,
 
+    /// Emit logs as newline-delimited JSON (useful for log aggregators).
+    /// Can also be set with PGX_LOG_JSON=1.
+    #[arg(
+        long = "log-json",
+        env = "PGX_LOG_JSON",
+        global = true,
+        default_value_t = false
+    )]
+    log_json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -52,6 +62,26 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // ── Initialise structured logging ─────────────────────────────────────────
+    // Log level is controlled by RUST_LOG (defaults to "info").
+    // JSON format is activated with --log-json or PGX_LOG_JSON=1.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if cli.log_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .init();
+    }
 
     // Resolve connection URL: flag > named connection > config default
     let url = resolve_url(cli.url, cli.connection)?;

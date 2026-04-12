@@ -25,6 +25,7 @@ use colored::Colorize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
+use tracing::{debug, error, info, warn};
 
 use crate::replication::{
     client::{ReplicationClient, ReplicationConfig, ReplicationEvent},
@@ -33,6 +34,32 @@ use crate::replication::{
     lsn::Lsn,
     slot,
 };
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM (kill / container stop).
+/// Returns when either signal is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI argument structs
@@ -567,52 +594,32 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn log_event(event: &WalEvent, lsn_str: &str) {
+    // Per-row events are logged at debug level — set RUST_LOG=debug to see them.
+    // In JSON mode each becomes a structured record; in text mode it is a
+    // coloured console line that mirrors the original output.
     match event {
-        WalEvent::Insert { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "INSERT".green(),
-            schema,
-            table.yellow(),
-            lsn_str
+        WalEvent::Insert { schema, table, .. } => debug!(
+            op = "insert", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
         ),
-        WalEvent::Update { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "UPDATE".yellow(),
-            schema,
-            table.yellow(),
-            lsn_str
+        WalEvent::Update { schema, table, .. } => debug!(
+            op = "update", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
         ),
-        WalEvent::Delete { schema, table, .. } => println!(
-            "{} [{}] {}.{} @ {}",
-            "◀".blue(),
-            "DELETE".red(),
-            schema,
-            table.yellow(),
-            lsn_str
+        WalEvent::Delete { schema, table, .. } => debug!(
+            op = "delete", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
         ),
-        WalEvent::Truncate { tables, .. } => println!(
-            "{} [{}] {} @ {}",
-            "◀".blue(),
-            "TRUNCATE".red(),
-            tables.join(", ").yellow(),
-            lsn_str
+        WalEvent::Truncate { tables, .. } => debug!(
+            op = "truncate", tables = %tables.join(", "), lsn = %lsn_str, "WAL event"
         ),
-        WalEvent::Begin { xid, .. } => println!("{} [{}] xid={xid}", "◀".blue(), "BEGIN".dimmed()),
-        WalEvent::Commit { .. } => println!("{} [{}] @ {}", "◀".blue(), "COMMIT".dimmed(), lsn_str),
+        WalEvent::Begin { xid, .. } => debug!(op = "begin", xid, "WAL event"),
+        WalEvent::Commit { .. } => debug!(op = "commit", lsn = %lsn_str, "WAL event"),
         WalEvent::Relation {
             schema,
             table,
             columns,
             ..
-        } => println!(
-            "{} [{}] {}.{} ({} cols)",
-            "◀".blue(),
-            "RELATION".cyan(),
-            schema,
-            table.cyan(),
-            columns.len()
+        } => debug!(
+            op = "relation", schema = %schema, table = %table,
+            col_count = columns.len(), "WAL schema event"
         ),
         WalEvent::Keepalive { .. } => {}
     }
@@ -628,20 +635,18 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
     // ── 1. Parse connection URL ───────────────────────────────────────────────
     let (host, port, user, password, database) = parse_postgres_url(&base_url)?;
 
-    // ── 2. Control-plane connection (tokio-postgres, normal SQL) ──────────────
-    // Used only for slot management and wal_level verification.
-    // Our inlined replication client handles the replication plane.
-    println!(
-        "{} Connecting to PostgreSQL…",
-        "pgx-replicate".cyan().bold()
-    );
+    // ── 2. One-time control-plane setup ──────────────────────────────────────
+    // Slot management only happens once before the retry loop: slots survive
+    // across connections, and re-running ensure_slot on every reconnect is
+    // harmless but noisy.
+    info!("Connecting to PostgreSQL…");
 
     let (mgmt_client, mgmt_conn) = tokio_postgres::connect(&base_url, NoTls)
         .await
         .context("Failed to connect to PostgreSQL")?;
     tokio::spawn(async move {
         if let Err(e) = mgmt_conn.await {
-            eprintln!("{} management connection error: {e}", "✗".red());
+            error!(error = %e, "Management connection error");
         }
     });
 
@@ -653,37 +658,30 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
     let wal_level: &str = rows[0].get(0);
     if wal_level != "logical" {
         bail!(
-            "wal_level is '{wal_level}' — logical replication requires 'logical'.\n\
+            "wal_level is '{wal_level}' \u{2014} logical replication requires 'logical'.\n\
              Set `wal_level = logical` in postgresql.conf and restart the server."
         );
     }
 
-    // Slot lifecycle
+    // Slot lifecycle (once, before the retry loop)
     if args.reset_slot {
-        println!(
-            "{} Dropping slot '{}' (--reset-slot)…",
-            "⚠".yellow(),
-            args.slot
-        );
+        warn!(slot = %args.slot, "Dropping slot (--reset-slot)");
         slot::drop_slot(&mgmt_client, &args.slot).await?;
     }
     slot::ensure_slot(&mgmt_client, &args.slot, args.temporary).await?;
-    println!("{} Slot '{}' ready.", "▶".green(), args.slot.yellow());
+    info!(slot = %args.slot, "Slot ready");
 
-    // ── 3. Build ReplicationConfig ────────────────────────────────────────────
-    // ReplicationConfig takes one publication string, so we join
-    // multiple publications as a comma-separated string. PostgreSQL's
-    // publication_names option accepts this format.
+    // ── 3. Build the base ReplicationConfig (cloned per attempt) ─────────────
     let pub_names = args.publications.join(", ");
 
-    let start_lsn = match &args.start_lsn {
+    let initial_lsn = match &args.start_lsn {
         Some(s) => {
             Lsn::parse(s).map_err(|e| anyhow::anyhow!("Invalid start LSN '{}': {}", s, e))?
         }
-        None => Lsn::ZERO, // server picks up from slot's confirmed_flush_lsn
+        None => Lsn::ZERO,
     };
 
-    let repl_cfg = ReplicationConfig {
+    let base_cfg = ReplicationConfig {
         host,
         port,
         user,
@@ -691,122 +689,209 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
         database,
         slot: args.slot.clone(),
         publication: pub_names.clone(),
-        start_lsn,
+        start_lsn: initial_lsn,
         ..Default::default()
     };
 
-    // ── 4. Open replication stream ────────────────────────────────────────────
-    println!(
-        "{} Starting replication from {} (publications: {})…",
-        "▶".green(),
-        start_lsn.to_string().yellow(),
-        pub_names.cyan()
-    );
-    println!(
-        "{} Forwarding to '{}' — Ctrl-C to stop.",
-        "▶".green(),
-        sink.name().cyan()
-    );
+    // ── 4. Reconnection loop ──────────────────────────────────────────────────
+    const BASE_DELAY_MS: u64 = 1_000;
+    const MAX_DELAY_MS: u64 = 60_000;
+    const MAX_ATTEMPTS: u32 = 10;
 
-    let mut repl_client = ReplicationClient::connect(repl_cfg)
-        .await
-        .context("Failed to open replication connection")?;
+    // The confirmed LSN advances each successful session.  It seeds start_lsn
+    // on the next connect so we resume from the last durable checkpoint.
+    let mut resume_lsn = initial_lsn;
+    let mut attempt: u32 = 0;
 
-    // ── 5. Main event loop ────────────────────────────────────────────────────
-    let mut rel_cache = RelationCache::new();
+    // Pin the shutdown future outside the retry loop so a signal cancels
+    // both the event loop and any in-progress backoff sleep.
+    tokio::pin!(let shutdown = shutdown_signal(););
 
     loop {
-        match repl_client.recv().await {
-            // ── Stream closed cleanly ─────────────────────────────────────────
-            Ok(None) => break,
+        // ── Backoff sleep (skipped on first attempt) ──────────────────────────
+        if attempt > 0 {
+            let base = (BASE_DELAY_MS * (1u64 << (attempt - 1).min(6))).min(MAX_DELAY_MS);
+            let jitter = base / 5;
+            let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
+            let delay = std::time::Duration::from_millis(delay_ms);
 
-            // ── Error from the replication worker ────────────────────────────
-            Err(e) => {
-                eprintln!("{} replication error: {e:#}", "✗".red());
-                break;
+            warn!(
+                attempt,
+                max_attempts = MAX_ATTEMPTS,
+                delay_secs = delay.as_secs_f32(),
+                "Reconnecting after connection loss"
+            );
+
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    info!("Signal received, shutting down");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(delay) => {}
             }
+        }
 
-            Ok(Some(ev)) => match ev {
-                // ── Keepalive: acknowledge so server can reclaim WAL segments ─
-                ReplicationEvent::KeepAlive { wal_end } => {
-                    repl_client.update_applied_lsn(wal_end);
+        if attempt >= MAX_ATTEMPTS {
+            return Err(anyhow::anyhow!(
+                "Giving up after {MAX_ATTEMPTS} consecutive connection failures"
+            ));
+        }
+
+        // ── Open replication stream ───────────────────────────────────────────
+        // Resume from the last confirmed LSN so we never re-deliver already-ACKed
+        // events and never skip events we didn't confirm.
+        let repl_cfg = ReplicationConfig {
+            start_lsn: resume_lsn,
+            ..base_cfg.clone()
+        };
+
+        info!(lsn = %resume_lsn, publications = %pub_names, "Starting replication…");
+        info!(sink = sink.name(), "Forwarding events — Ctrl-C to stop");
+
+        let mut repl_client = match ReplicationClient::connect(repl_cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "Failed to open replication connection");
+                attempt += 1;
+                continue;
+            }
+        };
+
+        // ── 5. Main event loop ────────────────────────────────────────────────
+        let mut rel_cache = RelationCache::new();
+        let mut clean_exit = false;
+
+        loop {
+            let ev = tokio::select! {
+                biased;
+
+                // ── Shutdown signal (SIGINT / SIGTERM) ────────────────────────
+                _ = &mut shutdown => {
+                    info!("Signal received, stopping replication");
+                    repl_client.stop();
+                    clean_exit = true;
+                    break;
                 }
 
-                // ── Transaction boundaries (Begin / Commit) ───────────────────
-                // The worker parses these from the pgoutput stream and surfaces
-                // them as typed events. Forward to the sink when requested.
-                ReplicationEvent::Begin {
-                    final_lsn,
-                    xid,
-                    commit_time,
-                } => {
-                    repl_client.update_applied_lsn(final_lsn);
-                    if args.emit_txn_boundaries {
-                        let event = WalEvent::Begin {
-                            lsn: final_lsn.to_string(),
-                            commit_time,
-                            xid,
-                        };
-                        log_event(&event, &final_lsn.to_string());
-                        let env = event_env(&event, &final_lsn.to_string());
-                        if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                            eprintln!("{} downstream error: {e:#}", "✗".red());
-                        }
+                // ── Next event from the replication worker ────────────────────
+                result = repl_client.recv() => result,
+            };
+
+            match ev {
+                // ── Stream closed cleanly ─────────────────────────────────────
+                Ok(None) => {
+                    clean_exit = true;
+                    break;
+                }
+
+                // ── Error from the replication worker ────────────────────────
+                Err(e) => {
+                    error!(error = %e, "Replication error");
+                    break;
+                }
+
+                Ok(Some(ev)) => match ev {
+                    // ── Keepalive: acknowledge so server can reclaim WAL ──────
+                    ReplicationEvent::KeepAlive { wal_end } => {
+                        repl_client.update_applied_lsn(wal_end);
                     }
-                }
 
-                ReplicationEvent::Commit {
-                    lsn,
-                    end_lsn,
-                    commit_time,
-                } => {
-                    repl_client.update_applied_lsn(end_lsn);
-                    if args.emit_txn_boundaries {
-                        let event = WalEvent::Commit {
-                            lsn: lsn.to_string(),
-                            end_lsn: end_lsn.to_string(),
-                            commit_time,
-                        };
-                        log_event(&event, &end_lsn.to_string());
-                        let env = event_env(&event, &end_lsn.to_string());
-                        if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                            eprintln!("{} downstream error: {e:#}", "✗".red());
-                        }
-                    }
-                }
-
-                // ── XLogData: raw pgoutput bytes (Insert/Update/Delete/etc.) ──
-                // The inlined client gives us the raw pgoutput payload directly;
-                // pass it straight to our binary decoder — no frame wrapping needed.
-                ReplicationEvent::XLogData { data, wal_end, .. } => {
-                    repl_client.update_applied_lsn(wal_end);
-                    let lsn_str = wal_end.to_string();
-
-                    match decode_pgoutput(&data, &mut rel_cache) {
-                        Ok(Some(event)) => {
-                            log_event(&event, &lsn_str);
-                            if should_forward(&event, &args) {
-                                let env = event_env(&event, &lsn_str);
-                                if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                                    eprintln!(
-                                        "{} downstream '{}' error: {e:#}",
-                                        "✗".red(),
-                                        sink.name()
-                                    );
-                                }
+                    // ── Transaction boundaries (Begin / Commit) ───────────────
+                    //
+                    // LSN durability: update_applied_lsn is called AFTER the sink
+                    // confirms delivery. If the sink returns an error or the process
+                    // crashes before this point, PostgreSQL will not advance its
+                    // confirmed_flush_lsn for this slot, so the event will be
+                    // re-delivered on reconnect \u2014 no data loss.
+                    ReplicationEvent::Begin {
+                        final_lsn,
+                        xid,
+                        commit_time,
+                    } => {
+                        if args.emit_txn_boundaries {
+                            let event = WalEvent::Begin {
+                                lsn: final_lsn.to_string(),
+                                commit_time,
+                                xid,
+                            };
+                            log_event(&event, &final_lsn.to_string());
+                            let env = event_env(&event, &final_lsn.to_string());
+                            if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
+                                error!(error = %e, "Downstream send failed (Begin); LSN not advanced");
+                                continue;
                             }
                         }
-                        Ok(None) => {} // Origin, Type, or other skipped message
-                        Err(e) => eprintln!("{} WAL decode error: {e:#}", "✗".red()),
+                        repl_client.update_applied_lsn(final_lsn);
                     }
-                }
-            },
+
+                    ReplicationEvent::Commit {
+                        lsn,
+                        end_lsn,
+                        commit_time,
+                    } => {
+                        if args.emit_txn_boundaries {
+                            let event = WalEvent::Commit {
+                                lsn: lsn.to_string(),
+                                end_lsn: end_lsn.to_string(),
+                                commit_time,
+                            };
+                            log_event(&event, &end_lsn.to_string());
+                            let env = event_env(&event, &end_lsn.to_string());
+                            if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
+                                error!(error = %e, "Downstream send failed (Commit); LSN not advanced");
+                                continue;
+                            }
+                        }
+                        repl_client.update_applied_lsn(end_lsn);
+                    }
+
+                    // ── XLogData (Insert/Update/Delete/etc.) ──────────────────
+                    ReplicationEvent::XLogData { data, wal_end, .. } => {
+                        let lsn_str = wal_end.to_string();
+
+                        match decode_pgoutput(&data, &mut rel_cache) {
+                            Ok(Some(event)) => {
+                                log_event(&event, &lsn_str);
+                                if should_forward(&event, &args) {
+                                    let env = event_env(&event, &lsn_str);
+                                    if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
+                                        error!(sink = sink.name(), error = %e, "Downstream send failed; LSN not advanced");
+                                        continue;
+                                    }
+                                }
+                                // ACK after confirmed delivery or intentional skip.
+                                repl_client.update_applied_lsn(wal_end);
+                            }
+                            Ok(None) => {
+                                // Intentionally skipped message type; safe to ACK.
+                                repl_client.update_applied_lsn(wal_end);
+                            }
+                            Err(e) => {
+                                // Decode failure — do not advance LSN.
+                                error!(error = %e, "WAL decode error; LSN not advanced");
+                            }
+                        }
+                    }
+                },
+            }
         }
+
+        // ── Post-loop: capture progress before dropping the client ────────────
+        // This is the last durably confirmed LSN from this session.  On the
+        // next connect we pass it as start_lsn so the slot resumes exactly
+        // from where we left off.
+        resume_lsn = repl_client.last_applied_lsn();
+
+        if clean_exit {
+            break;
+        }
+
+        // Unplanned disconnect \u2014 increment and loop back to backoff + reconnect.
+        warn!(attempt, "Connection lost, will retry");
+        attempt += 1;
     }
 
-    println!(
-        "{} Replication stream closed.",
-        "pgx-replicate".cyan().bold()
-    );
+    info!("Replication stream closed");
     Ok(())
 }

@@ -4,8 +4,35 @@ use colored::Colorize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
+use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM (kill / container stop).
+/// Returns when either signal is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 
 #[derive(Args)]
 pub struct ListenArgs {
@@ -103,89 +130,181 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 pub async fn run(url: String, args: ListenArgs) -> Result<()> {
     let sink: Arc<dyn Downstream> = build_downstream(&args.downstream).await?;
 
-    println!("{} Connecting to PostgreSQL…", "pgx-listen".cyan().bold());
+    // Backoff parameters for reconnection.
+    const BASE_DELAY_MS: u64 = 1_000;
+    const MAX_DELAY_MS: u64 = 60_000;
+    const MAX_ATTEMPTS: u32 = 10;
 
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
-        .await
-        .context("Failed to connect to PostgreSQL")?;
+    // Pin the shutdown future outside the retry loop so a signal cancels
+    // both the event loop and any in-progress backoff sleep.
+    tokio::pin!(let shutdown = shutdown_signal(););
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
+    let mut attempt: u32 = 0;
 
-    tokio::spawn(async move {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::{Context as Cx, Poll};
+    loop {
+        // ── Backoff sleep (skipped on first attempt) ──────────────────────────
+        if attempt > 0 {
+            // Exponential backoff: 1s, 2s, 4s, … capped at 60s, ±20% jitter.
+            let base = (BASE_DELAY_MS * (1u64 << (attempt - 1).min(6))).min(MAX_DELAY_MS);
+            let jitter = base / 5;
+            let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
+            let delay = std::time::Duration::from_millis(delay_ms);
 
-        struct Drainer {
-            conn: tokio_postgres::Connection<
-                tokio_postgres::Socket,
-                tokio_postgres::tls::NoTlsStream,
-            >,
-            tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
-        }
+            warn!(
+                attempt,
+                max_attempts = MAX_ATTEMPTS,
+                delay_secs = delay.as_secs_f32(),
+                "Connection lost, reconnecting…"
+            );
 
-        impl Future for Drainer {
-            type Output = ();
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
-                loop {
-                    match self.conn.poll_message(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(None) => return Poll::Ready(()),
-                        Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(n)))) => {
-                            let _ = self.tx.send(n);
-                        }
-                        Poll::Ready(Some(Ok(_))) => {}
-                        Poll::Ready(Some(Err(e))) => {
-                            eprintln!("{} connection error: {e}", "✗".red());
-                            return Poll::Ready(());
-                        }
-                    }
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    info!("Signal received, shutting down");
+                    return Ok(());
                 }
+                _ = tokio::time::sleep(delay) => {}
             }
         }
 
-        Drainer {
-            conn: connection,
-            tx,
+        if attempt >= MAX_ATTEMPTS {
+            return Err(anyhow::anyhow!(
+                "Giving up after {MAX_ATTEMPTS} consecutive connection failures"
+            ));
         }
-        .await;
-    });
 
-    for ch in &args.channels {
-        client
-            .execute(&format!("LISTEN \"{ch}\""), &[])
-            .await
-            .with_context(|| format!("LISTEN {ch} failed"))?;
-        println!("{} Listening on channel '{}'", "▶".green(), ch.yellow());
-    }
+        // ── Connect ───────────────────────────────────────────────────────────
+        info!("Connecting to PostgreSQL…");
 
-    println!(
-        "{} Forwarding to '{}' — Ctrl-C to stop.",
-        "▶".green(),
-        sink.name().cyan()
-    );
-
-    while let Some(n) = rx.recv().await {
-        let event = NotifyEvent {
-            channel: n.channel().to_string(),
-            payload: n.payload().to_string(),
-            pid: n.process_id() as i32,
+        let (client, connection) = match tokio_postgres::connect(&url, NoTls).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!(error = %e, "Connection failed");
+                attempt += 1;
+                continue;
+            }
         };
 
-        println!(
-            "{} [{}] pid={} payload={}",
-            "◀".blue(),
-            event.channel.yellow(),
-            event.pid,
-            &event.payload,
-        );
+        // ── Spawn Drainer task ────────────────────────────────────────────────
+        // The Drainer bridges the tokio-postgres connection future into an mpsc
+        // channel we can select! on. A fresh channel is created each reconnect
+        // so there is no risk of stale notifications from a previous session.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
 
-        if let Err(e) = sink.send(&event).await {
-            eprintln!("{} downstream '{}' error: {e:#}", "✗".red(), sink.name());
+        tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                use std::future::Future;
+                use std::pin::Pin;
+                use std::task::{Context as Cx, Poll};
+
+                struct Drainer {
+                    conn: tokio_postgres::Connection<
+                        tokio_postgres::Socket,
+                        tokio_postgres::tls::NoTlsStream,
+                    >,
+                    tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
+                }
+
+                impl Future for Drainer {
+                    type Output = ();
+                    fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
+                        loop {
+                            match self.conn.poll_message(cx) {
+                                Poll::Pending => return Poll::Pending,
+                                Poll::Ready(None) => return Poll::Ready(()),
+                                Poll::Ready(Some(Ok(
+                                    tokio_postgres::AsyncMessage::Notification(n),
+                                ))) => {
+                                    let _ = self.tx.send(n);
+                                }
+                                Poll::Ready(Some(Ok(_))) => {}
+                                Poll::Ready(Some(Err(e))) => {
+                                    error!(error = %e, "PostgreSQL connection error");
+                                    return Poll::Ready(());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Drainer {
+                    conn: connection,
+                    tx,
+                }
+                .await;
+            }
+        });
+
+        // ── LISTEN on each channel ────────────────────────────────────────────
+        let mut listen_ok = true;
+        for ch in &args.channels {
+            match client.execute(&format!("LISTEN \"{ch}\""), &[]).await {
+                Ok(_) => info!(channel = %ch, "Listening on channel"),
+                Err(e) => {
+                    error!(channel = %ch, error = %e, "LISTEN failed");
+                    listen_ok = false;
+                    break;
+                }
+            }
+        }
+        if !listen_ok {
+            attempt += 1;
+            continue;
+        }
+
+        info!(sink = sink.name(), "Forwarding events — Ctrl-C to stop");
+
+        // ── Event loop for this connection ────────────────────────────────────
+        // Returns true if the disconnect was unplanned (should reconnect).
+        let disconnected = loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut shutdown => {
+                    info!("Signal received, shutting down");
+                    return Ok(());
+                }
+
+                maybe_n = rx.recv() => {
+                    let Some(n) = maybe_n else {
+                        // Drainer exited — connection dropped.
+                        break true;
+                    };
+
+                    let event = NotifyEvent {
+                        channel: n.channel().to_string(),
+                        payload: n.payload().to_string(),
+                        pid: n.process_id() as i32,
+                    };
+
+                    // Per-event record at debug level.
+                    // - Text mode (default): set RUST_LOG=debug to see it.
+                    // - JSON mode (--log-json): becomes a structured record
+                    //   parseable by log aggregators.
+                    debug!(
+                        channel = %event.channel,
+                        pid = event.pid,
+                        payload = %event.payload,
+                        "NOTIFY received"
+                    );
+
+                    if let Err(e) = sink.send(&event).await {
+                        error!(sink = sink.name(), error = %e, "Downstream send failed");
+                    }
+                }
+            }
+        };
+
+        if disconnected {
+            warn!("Connection dropped unexpectedly");
+            attempt += 1;
+        } else {
+            break;
         }
     }
 
-    println!("{} Connection closed.", "pgx-listen".cyan().bold());
+    info!("Stopped");
     Ok(())
 }
 

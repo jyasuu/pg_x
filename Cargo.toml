@@ -1,84 +1,111 @@
 [package]
-name = "pgx"
+name = "esync"
 version = "0.1.0"
 edition = "2021"
-description = "A feature-rich PostgreSQL CLI tool — beyond psql"
-authors = ["jyasuu"]
+description = "CLI tool to sync PostgreSQL data to Elasticsearch via GraphQL"
 
 [[bin]]
-name = "pgx"
+name = "esync"
 path = "src/main.rs"
+
+# Expose internals for integration tests
+[lib]
+name = "esync"
+path = "src/lib.rs"
+
+# ── Integration test targets ──────────────────────────────────────────────
+[[test]]
+name = "test_mapping"
+path = "tests/test_mapping.rs"
+
+[[test]]
+name = "test_elastic"
+path = "tests/test_elastic.rs"
+
+[[test]]
+name = "test_index_command"
+path = "tests/test_index_command.rs"
+
+[[test]]
+name = "test_watch_cdc"
+path = "tests/test_watch_cdc.rs"
+
+[[test]]
+name = "test_graphql"
+path = "tests/test_graphql.rs"
+
+[[test]]
+name = "test_relations"
+path = "tests/test_relations.rs"
+
+[[test]]
+name = "test_search"
+path = "tests/test_search.rs"
+
+[[test]]
+name = "test_search_text"
+path = "tests/test_search_text.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
+clap        = { version = "4", features = ["derive", "env"] }
+tokio       = { version = "1", features = ["full"] }
+anyhow      = "1"
+thiserror   = "1"
 
-# Postgres async driver (control plane: slot management, wal_level check)
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
-postgres-types = { version = "0.2", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+# Config
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+serde_yaml  = "0.9"
 
-# TLS for the control-plane connection (optional)
-tokio-postgres-rustls = { version = "0.10", optional = true }
-rustls = { version = "0.21", optional = true }
+# Database
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "uuid", "chrono", "json"] }
 
-# Excel output
-rust_xlsxwriter = "0.64"
+# GraphQL server
+# async-graphql-axum 7.x pulls axum 0.8; pin axum to match exactly.
+async-graphql      = { version = "7", features = ["uuid", "chrono", "dynamic-schema", "unblock"] }
+async-graphql-axum = "7"
+axum          = { version = "0.8", features = ["ws"] }
+tower         = "0.5"
+tower-http    = { version = "0.6", features = ["cors", "trace"] }
 
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# HTTP client — used for the ES client layer
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# Output / display
-comfy-table = "7"
-indicatif = "0.17"
-console = "0.15"
-colored = "2"
+# Test serialisation (also used by [[test]] integration targets)
+serial_test  = { version = "3", optional = false }
 
-# Error handling
-anyhow = "1"
-thiserror = "1"
+# Utilities
+uuid       = { version = "1", features = ["v4", "serde"] }
+chrono     = { version = "0.4", features = ["serde"] }
+indexmap   = { version = "2", features = ["serde"] }
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif  = "0.17"
+colored    = "2"
+futures    = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+bytes      = "1"
+sha2       = "0.10"
+base64     = "0.22"
+rsa        = { version = "0.9", features = ["sha2"] }
 
-# Misc
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
-dirs = "5"
-toml = "0.8"
-url = "2"
-regex = "1"
-csv = "1"
-once_cell = "1"
+# ── SAP MM integration test targets ──────────────────────────────────────────
+[[test]]
+name = "test_mm_index"
+path = "tests/sap_mm/test_mm_index.rs"
 
-# Async utilities
-async-trait = "0.1"
+[[test]]
+name = "test_mm_graphql"
+path = "tests/sap_mm/test_mm_graphql.rs"
 
-# Replication frame parsing and SCRAM auth
-# (used by our inlined replication client in src/replication/)
-bytes = "1"
-hex = "0.4"
-base64 = "0.22"
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.9"
+[[test]]
+name = "test_mm_cdc"
+path = "tests/sap_mm/test_mm_cdc.rs"
 
-# RabbitMQ (AMQP) - feature-gated
-lapin = { version = "2", optional = true }
+[[test]]
+name = "test_mm_search"
+path = "tests/sap_mm/test_mm_search.rs"
 
-# HTTP client for webhook - feature-gated
-reqwest = { version = "0.12", features = ["json"], optional = true }
-
-# Kafka - feature-gated (requires librdkafka system library)
-rdkafka = { version = "0.36", optional = true }
-
-[features]
-default = ["rabbitmq", "webhook"]
-tls = ["tokio-postgres-rustls", "rustls"]
-rabbitmq = ["lapin"]
-kafka = ["rdkafka"]
-webhook = ["reqwest"]
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
+[dev-dependencies]
+tokio-test  = "0.4"

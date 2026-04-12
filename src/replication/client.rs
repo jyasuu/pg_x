@@ -191,6 +191,16 @@ impl ReplicationClient {
         self.progress.update_applied(lsn);
     }
 
+    /// Return the last LSN that has been durably confirmed by the caller.
+    ///
+    /// Used to seed `start_lsn` when reconnecting after a drop so the slot
+    /// resumes from the last acknowledged position rather than from the
+    /// originally requested start LSN.
+    #[inline]
+    pub fn last_applied_lsn(&self) -> Lsn {
+        self.progress.load_applied()
+    }
+
     /// Request graceful shutdown.
     pub fn stop(&self) {
         let _ = self.stop_tx.send(true);
