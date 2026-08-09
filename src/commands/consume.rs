@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::commands::consume_session::{Compose, ConsumeSession};
 use crate::consumer::r#trait::{ConsumeSink, Consumer};
@@ -309,6 +309,13 @@ impl ConsumeSink for EmbeddingSink {
 
     async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
         let text = interpolate(&self.template, doc);
+        if text.trim().is_empty() {
+            bail!(
+                "embedding template '{0}' rendered empty text ({1} chars) — check the field it references",
+                self.template,
+                text.len()
+            );
+        }
         let vec = self.embedder.embed(&text).await?;
         if let Some(dim) = self.dim {
             if vec.len() != dim {
@@ -374,6 +381,23 @@ impl PostgresVectorConsumeSink {
         format!("[{}]", nums.join(","))
     }
 
+    /// Quote an identifier for safe interpolation into SQL, mirroring
+    /// Postgres' `quote_ident`: identifiers that are safe unquoted are
+    /// returned as-is; everything else is double-quoted with embedded quotes
+    /// doubled.
+    fn quote_ident(name: &str) -> String {
+        let safe = !name.is_empty()
+            && !name.as_bytes()[0].is_ascii_digit()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if safe {
+            name.to_string()
+        } else {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
+    }
+
     /// The upsert statement. The vector is bound as a `text` parameter and
     /// cast via `$2::text::vector`: binding it as a `vector` parameter
     /// directly fails client-side, because tokio-postgres rejects a `String`
@@ -382,7 +406,7 @@ impl PostgresVectorConsumeSink {
         format!(
             "INSERT INTO {} (id, embedding) VALUES ($1, $2::text::vector) \
              ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
-            table
+            Self::quote_ident(table)
         )
     }
 }
@@ -533,6 +557,18 @@ fn resolve_sink_kinds(args: &ConsumeArgs, cfg: Option<&ConsumeConfig>) -> Vec<Co
     } else {
         vec![ConsumeSinkKind::Stdout]
     }
+}
+
+/// Whether a multi-sink fan-out runs without a stable sink key. With no
+/// `--id-field` naming a document field and `--idempotent` off, sinks like
+/// elasticsearch auto-generate their record id, so a redelivery after a
+/// later-sink failure appends a duplicate instead of overwriting.
+fn fanout_lacks_stable_keys(
+    kinds: &[ConsumeSinkKind],
+    idempotent: bool,
+    id_field: Option<&str>,
+) -> bool {
+    kinds.len() > 1 && !idempotent && id_field.is_none()
 }
 
 /// Map a CLI sink type to a config kind, pulling its options from the args.
@@ -862,13 +898,23 @@ pub async fn run(
 
     // ── Embedding stage: resolve once, before the session loop ──────────────
     let eff_embed = EffectiveEmbedConfig::resolve(&args, cfg)?;
+    let sink_kinds = resolve_sink_kinds(&args, cfg);
     if eff_embed.is_none()
-        && resolve_sink_kinds(&args, cfg)
+        && sink_kinds
             .iter()
             .any(|k| matches!(k, ConsumeSinkKind::PostgresVector { .. }))
     {
         anyhow::bail!(
             "postgres-vector sink requires the embedding stage — provide --embed-url (or consume.embed.url)"
+        );
+    }
+
+    // A fan-out with no stable sink key appends on redelivery instead of
+    // overwriting (elasticsearch auto-generates its _id). Surface it up front.
+    if fanout_lacks_stable_keys(&sink_kinds, eff.idempotent, args.id_field.as_deref()) {
+        warn!(
+            "fan-out across {} sinks with no stable sink key (no --idempotent, no --id-field): a redelivery after a later-sink failure can duplicate records. Add --idempotent or --id-field so redelivery upserts instead of appends.",
+            sink_kinds.len()
         );
     }
 
@@ -1284,6 +1330,38 @@ mod sink_resolution_tests {
             }]
         );
     }
+
+    fn fanout_kinds() -> Vec<ConsumeSinkKind> {
+        vec![
+            ConsumeSinkKind::Stdout,
+            ConsumeSinkKind::Elasticsearch {
+                url: "http://localhost:9200".to_string(),
+                index: "pgx".to_string(),
+                id_field: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn fanout_without_stable_key_warns() {
+        assert!(fanout_lacks_stable_keys(&fanout_kinds(), false, None));
+    }
+
+    #[test]
+    fn single_sink_never_warns() {
+        let kinds = vec![ConsumeSinkKind::Stdout];
+        assert!(!fanout_lacks_stable_keys(&kinds, false, None));
+    }
+
+    #[test]
+    fn idempotent_or_id_field_suppress_fanout_warning() {
+        assert!(!fanout_lacks_stable_keys(&fanout_kinds(), true, None));
+        assert!(!fanout_lacks_stable_keys(
+            &fanout_kinds(),
+            false,
+            Some("mat_no")
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1525,6 +1603,52 @@ mod embedding_sink_tests {
     }
 
     #[tokio::test]
+    async fn empty_rendered_text_fails_fast() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![0.1],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder,
+            template: "{content}".to_string(),
+            output_field: "embedding".to_string(),
+            dim: None,
+        };
+
+        let doc = json!({ "name": "no content field" });
+        let err = decorator.send(&doc, Some("m1")).await.unwrap_err();
+        assert!(err.to_string().contains("empty text"), "{err}");
+        assert!(err.to_string().contains("{content}"), "{err}");
+        assert!(inner.docs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_text_fails_fast() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![0.1],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder,
+            template: "{content}".to_string(),
+            output_field: "embedding".to_string(),
+            dim: None,
+        };
+
+        let doc = json!({ "content": "  \n\t " });
+        assert!(decorator.send(&doc, Some("m1")).await.is_err());
+        assert!(inner.docs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn fanout_delivers_to_every_sink() {
         let a = Arc::new(RecordingSink {
             docs: Mutex::new(Vec::new()),
@@ -1590,5 +1714,32 @@ mod postgres_vector_sink_tests {
         let sql = PostgresVectorConsumeSink::upsert_sql("chunk_embeddings");
         assert!(sql.contains("VALUES ($1, $2::text::vector)"));
         assert!(sql.contains("ON CONFLICT (id) DO UPDATE"));
+    }
+
+    #[test]
+    fn upsert_sql_quotes_unsafe_table_names() {
+        let sql = PostgresVectorConsumeSink::upsert_sql("my-tables");
+        assert!(
+            sql.starts_with("INSERT INTO \"my-tables\" (id, embedding)"),
+            "{sql}"
+        );
+
+        let plain = PostgresVectorConsumeSink::upsert_sql("embeddings");
+        assert!(
+            plain.starts_with("INSERT INTO embeddings (id, embedding)"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn upsert_sql_neutralizes_identifier_injection() {
+        // The whole malicious suffix lands inside a single quoted identifier,
+        // so nothing can break out into a second statement.
+        let sql =
+            PostgresVectorConsumeSink::upsert_sql("chunk_embeddings\"; DROP TABLE documents;--");
+        assert!(
+            sql.contains("\"chunk_embeddings\"\"; DROP TABLE documents;--\""),
+            "{sql}"
+        );
     }
 }

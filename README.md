@@ -523,6 +523,46 @@ batch_by = "mat_no"
 | `contract` | Query name derived from `meta.event_type` in the ContractMessage payload        |
 | `simple`   | Fixed query name specified via `--query`                                        |
 
+### Embedding stage
+
+An optional stage between GraphQL composition and sink delivery: each composed
+document is interpolated through a template, embedded via a vector model, and
+the resulting vector is attached under an output field before the sinks run.
+Pair it with the `elasticsearch` (`dense_vector`) or `postgres-vector` sink for
+semantic search.
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink elasticsearch \
+  --es-url http://localhost:9200 \
+  --index materials \
+  --embed-url http://localhost:11434 \
+  --embed-model bge-m3 \
+  --embed-template "{name}: {description}" \
+  --embed-dim 1024
+```
+
+Templates interpolate document fields with `{field}`; a missing field renders
+empty. The default template embeds the whole `content` field.
+
+| Flag                   | Description                                        | Default      |
+| ---------------------- | -------------------------------------------------- | ------------ |
+| `--embed-url`          | Embedding API base URL (Ollama or OpenAI-style)    | — (enables the stage) |
+| `--embed-api`          | API dialect: `ollama` or `openai`                  | `ollama`     |
+| `--embed-model`        | Model name (e.g. `bge-m3`, `text-embedding-3-small`) | —         |
+| `--embed-field`        | Document field the default template embeds         | `content`    |
+| `--embed-template`     | `{field}` template for the text to embed           | `{content}`  |
+| `--embed-output-field` | Field the embedding vector is attached under       | `embedding`  |
+| `--embed-dim`          | Expected vector dimension (mismatches fail fast)   | unset        |
+
+> **Troubleshooting — "embeddings is empty":** when the template renders empty
+> text the sink stage fails fast with
+> `embedding template '<tpl>' rendered empty text (0 chars)`. Fix the template
+> or the field it references; a document with no embeddable text cannot be
+> embedded.
+
 ### Sinks
 
 #### stdout
@@ -601,6 +641,51 @@ pgx -U $DATABASE_URL consume \
 
 The key is constructed as `{key_prefix}{value_of_key_field}`. If `key_field` is
 not set or the field is missing, a random UUID is used as the suffix.
+
+#### postgres-vector (pgvector)
+
+Upserts each composed document's embedding into a Postgres table of
+`(id, embedding)` pairs via `INSERT ... ON CONFLICT (id) DO UPDATE`. Run it as a
+second sink to keep a pgvector index alongside another store:
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink elasticsearch \
+  --sink postgres-vector \
+  --es-url http://localhost:9200 \
+  --index materials \
+  --embed-url http://localhost:11434 \
+  --embed-model bge-m3 \
+  --embed-dim 1024 \
+  --idempotent
+```
+
+The table defaults to `chunk_embeddings` (override with `--vector-table`); it
+needs `id` as its primary key and an `embedding vector(N)` column where `N`
+matches `--embed-dim`. The row id comes from `--id-field`, else the message id
+(idempotent mode).
+
+> **FK dependency:** if `chunk_embeddings.id` is a foreign key to your documents
+> table, the document row must exist before the embedding is upserted or the
+> FK violation requeues forever (lenient mode). List `elasticsearch` before
+> `postgres-vector` so the document lands first.
+
+| Flag             | Description                              | Default            |
+| ---------------- | ---------------------------------------- | ------------------ |
+| `--vector-table` | pgvector table to upsert into            | `chunk_embeddings` |
+
+#### Fan-out (repeatable `--sink`)
+
+`--sink` is repeatable. With more than one sink the composed document is
+delivered to all of them in order; the first failure short-circuits the rest.
+
+> **Warning:** `consume` prints a startup warning when it fans out to multiple
+> sinks without `--idempotent` or `--id-field`. A redelivery after a later-sink
+> failure then appends rather than overwrites (elasticsearch auto-generates its
+> `_id`), duplicating records. Pass `--idempotent` (or an explicit `--id-field`)
+> so redelivery upserts instead of append.
 
 #### Idempotent mode
 

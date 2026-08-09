@@ -161,68 +161,90 @@ $PGX -U "$PGURL" consume \
   --query-mode contract \
   --idempotent > /tmp/pgx_consume_embed.log 2>&1 &
 CONSUME_PID=$!
-sleep 3
+# Wait for the consumer to declare + bind the queue before publishing, or the
+# message is dropped (no queue bound to the exchange yet).
+for _ in $(seq 1 20); do
+  if curl -s -m 2 -u guest:guest "http://localhost:15672/api/queues/%2F/pgx-embedding" 2>/dev/null \
+    | grep -q '"name"'; then
+    break
+  fi
+  sleep 1
+done
 
 echo "==> consume-embedding: publishing the contract message (first time)"
 publish_once
 
-# The ES bulk buffer flushes on a 5s ticker.
-sleep 8
+# The ES bulk buffer flushes on a 5s ticker; poll instead of sleeping a fixed
+# duration so the script is neither flaky on slow CI nor slow on fast machines.
+wait_for_es_doc() {
+  for _ in $(seq 1 60); do
+    if curl -s -m 2 "$ES_URL/documents/_doc/$DOC_ID" 2>/dev/null \
+      | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    src = d.get('_source', {})
+    emb = src.get('embedding')
+    sys.exit(0 if isinstance(emb, list) and len(emb) == 1024
+                 and src.get('name') == 'Premium Cotton Canvas' else 1)
+except Exception:
+    sys.exit(1)
+"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
-echo "==> consume-embedding: verifying exactly one ES document with an embedding"
+wait_for_pg_row() {
+  for _ in $(seq 1 60); do
+    count=$(psql -At "$PGURL" -c "SELECT count(*) FROM chunk_embeddings WHERE id = '$DOC_ID';" 2>/dev/null || true)
+    dim=$(psql -At "$PGURL" -c "SELECT vector_dims(embedding) FROM chunk_embeddings WHERE id = '$DOC_ID';" 2>/dev/null || true)
+    if [ "$count" = "1" ] && [ "$dim" = "$EMBED_DIM" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+fail_verify() {
+  local msg=$1
+  cleanup $CONSUME_PID
+  [ -n "${EMBED_PID:-}" ] && cleanup "$EMBED_PID"
+  echo "==> consume-embedding: FAIL — $msg"
+  cat /tmp/pgx_consume_embed.log
+  exit 1
+}
+
+echo "==> consume-embedding: waiting for the ES document and pgvector row"
+if ! wait_for_es_doc; then
+  fail_verify "expected a 1024-dim embedding on $DOC_ID"
+fi
+echo "==> consume-embedding: ES document carries a 1024-dim embedding"
+
 ES_COUNT=$(curl -s "$ES_URL/documents/_count" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
-if [ "$ES_COUNT" != "1" ]; then
-  cleanup $CONSUME_PID
-  [ -n "${EMBED_PID:-}" ] && cleanup "$EMBED_PID"
-  echo "==> consume-embedding: FAIL — expected 1 ES document, got $ES_COUNT"
-  cat /tmp/pgx_consume_embed.log
-  exit 1
-fi
-curl -s "$ES_URL/documents/_doc/$DOC_ID" \
-  | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-src = d['_source']
-emb = src.get('embedding')
-assert isinstance(emb, list) and len(emb) == 1024, f'embedding missing or wrong dim: {src.get(\"embedding\")}'
-assert src.get('name') == 'Premium Cotton Canvas', src.get('name')
-print('==> consume-embedding: ES document carries a 1024-dim embedding')
-"
+[ "$ES_COUNT" = "1" ] || fail_verify "expected 1 ES document, got $ES_COUNT"
 
-echo "==> consume-embedding: verifying exactly one chunk_embeddings row"
-PG_COUNT=$(psql -At "$PGURL" -c "SELECT count(*) FROM chunk_embeddings WHERE id = '$DOC_ID';")
-if [ "$PG_COUNT" != "1" ]; then
-  cleanup $CONSUME_PID
-  [ -n "${EMBED_PID:-}" ] && cleanup "$EMBED_PID"
-  echo "==> consume-embedding: FAIL — expected 1 chunk_embeddings row, got $PG_COUNT"
-  cat /tmp/pgx_consume_embed.log
-  exit 1
+if ! wait_for_pg_row; then
+  fail_verify "expected a $EMBED_DIM-dim chunk_embeddings row for $DOC_ID"
 fi
-PG_DIM=$(psql -At "$PGURL" -c "SELECT vector_dims(embedding) FROM chunk_embeddings WHERE id = '$DOC_ID';")
-if [ "$PG_DIM" != "$EMBED_DIM" ]; then
-  cleanup $CONSUME_PID
-  [ -n "${EMBED_PID:-}" ] && cleanup "$EMBED_PID"
-  echo "==> consume-embedding: FAIL — expected embedding dim $EMBED_DIM, got $PG_DIM"
-  cat /tmp/pgx_consume_embed.log
-  exit 1
-fi
-echo "==> consume-embedding: chunk_embeddings row has a ${PG_DIM}-dim vector"
+echo "==> consume-embedding: chunk_embeddings row has a ${EMBED_DIM}-dim vector"
 
 # ── Idempotent re-publish: still exactly one of each ────────────────────────
 echo "==> consume-embedding: re-publishing the same message"
 publish_once
-sleep 8
 
+if ! wait_for_es_doc || ! wait_for_pg_row; then
+  fail_verify "idempotent re-publish failed to land the doc and row"
+fi
 ES_COUNT2=$(curl -s "$ES_URL/documents/_count" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
 PG_COUNT2=$(psql -At "$PGURL" -c "SELECT count(*) FROM chunk_embeddings WHERE id = '$DOC_ID';")
 if [ "$ES_COUNT2" != "1" ] || [ "$PG_COUNT2" != "1" ]; then
-  cleanup $CONSUME_PID
-  [ -n "${EMBED_PID:-}" ] && cleanup "$EMBED_PID"
-  echo "==> consume-embedding: FAIL — idempotent re-publish left duplicates (es=$ES_COUNT2 pg=$PG_COUNT2)"
-  cat /tmp/pgx_consume_embed.log
-  exit 1
+  fail_verify "idempotent re-publish left duplicates (es=$ES_COUNT2 pg=$PG_COUNT2)"
 fi
 echo "==> consume-embedding: idempotent re-publish left exactly one of each"
 
