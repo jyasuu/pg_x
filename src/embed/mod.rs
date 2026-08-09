@@ -165,54 +165,18 @@ impl Embed for EmbedClient {
 
 // ── Embeddable-text template interpolation ───────────────────────────────────
 
-/// Interpolate `{field}` and dotted `{a.b}` placeholders from `doc` into
-/// `template`. Missing paths render empty; non-placeholder text is preserved.
-pub fn interpolate(template: &str, doc: &Value) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    loop {
-        match rest.find('{') {
-            None => {
-                out.push_str(rest);
-                break;
-            }
-            Some(start) => {
-                out.push_str(&rest[..start]);
-                let after = &rest[start + 1..];
-                match after.find('}') {
-                    None => {
-                        out.push_str(&rest[start..]);
-                        break;
-                    }
-                    Some(end) => {
-                        let path = &after[..end];
-                        out.push_str(&lookup(path, doc).unwrap_or_default());
-                        rest = &after[end + 1..];
-                    }
-                }
-            }
-        }
-    }
-    out
+/// Interpolate a Jinja2 template (`{{field}}`, dotted `{{a.b}}`) from `doc`.
+/// Missing paths render empty; non-placeholder text is preserved. Fails only
+/// when the template itself is malformed.
+pub fn interpolate(template: &str, doc: &Value) -> Result<String> {
+    minijinja::Environment::new()
+        .render_str(template, doc)
+        .map_err(|e| anyhow!("invalid embed template: {e}"))
 }
 
-/// The default template for embedding `field`: `{field}`.
+/// The default template for embedding `field`: `{{field}}`.
 pub fn default_template(field: &str) -> String {
-    format!("{{{field}}}")
-}
-
-/// Resolve a (possibly dotted) path from `doc`. Strings render verbatim,
-/// other scalars via their JSON representation; missing paths are `None`.
-fn lookup(path: &str, doc: &Value) -> Option<String> {
-    let mut current = doc;
-    for part in path.split('.') {
-        current = current.get(part)?;
-    }
-    match current {
-        Value::String(s) => Some(s.clone()),
-        Value::Null => None,
-        _ => Some(current.to_string()),
-    }
+    format!("{{{{{field}}}}}")
 }
 
 #[cfg(test)]
@@ -291,41 +255,46 @@ mod template_tests {
 
     #[test]
     fn plain_field() {
-        assert_eq!(interpolate("{content}", &doc()), "premium cotton");
+        assert_eq!(interpolate("{{content}}", &doc()).unwrap(), "premium cotton");
     }
 
     #[test]
     fn dotted_path() {
-        assert_eq!(interpolate("{meta.status}", &doc()), "active");
-        assert_eq!(interpolate("{meta.rank}", &doc()), "2");
+        assert_eq!(interpolate("{{meta.status}}", &doc()).unwrap(), "active");
+        assert_eq!(interpolate("{{meta.rank}}", &doc()).unwrap(), "2");
     }
 
     #[test]
     fn missing_path_renders_empty() {
-        assert_eq!(interpolate("{missing}", &doc()), "");
-        assert_eq!(interpolate("{meta.missing}", &doc()), "");
+        assert_eq!(interpolate("{{missing}}", &doc()).unwrap(), "");
+        assert_eq!(interpolate("{{meta.missing}}", &doc()).unwrap(), "");
     }
 
     #[test]
     fn mixed_text_preserved() {
         assert_eq!(
-            interpolate("{content}\n-- {source} --", &doc()),
+            interpolate("{{content}}\n-- {{source}} --", &doc()).unwrap(),
             "premium cotton\n-- catalog --"
         );
     }
 
     #[test]
     fn no_placeholders_passthrough() {
-        assert_eq!(interpolate("literal text", &doc()), "literal text");
+        assert_eq!(interpolate("literal text", &doc()).unwrap(), "literal text");
     }
 
     #[test]
-    fn unterminated_placeholder_left_as_is() {
-        assert_eq!(interpolate("a {content", &doc()), "a {content");
+    fn single_braces_pass_through() {
+        assert_eq!(interpolate("a {content", &doc()).unwrap(), "a {content");
+    }
+
+    #[test]
+    fn malformed_template_fails() {
+        assert!(interpolate("{{unclosed", &doc()).is_err());
     }
 
     #[test]
     fn default_template_is_field() {
-        assert_eq!(default_template("content"), "{content}");
+        assert_eq!(default_template("content"), "{{content}}");
     }
 }

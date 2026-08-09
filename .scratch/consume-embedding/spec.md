@@ -49,7 +49,7 @@ strict → abort). Nothing changes when the embedding stage is not configured.
 2. As an operator, I want the text that gets embedded to be selectable, so that
    the semantic representation matches what retrieval actually queries.
 3. As an operator, I want the embeddable text to be a template over the composed
-   document (e.g. `{content}` or `{content}\n{source}`), so that I can shape
+   document (e.g. `{{content}}` or `{{content}}\n{{source}}`), so that I can shape
    multi-field documents for better embeddings.
 4. As an operator, I want the embedding API to be configurable via URL and model,
    so that I can point at my own Ollama or OpenAI-compatible endpoint.
@@ -122,8 +122,10 @@ strict → abort). Nothing changes when the embedding stage is not configured.
   formats are unit-tested without a server.
 - **Template.** The embeddable text defaults to the composed document's
   `content` field. `--embed-template` (config `embed.template`) interpolates
-  `{field}` and dotted `{a.b}` placeholders from the document; missing paths
-  render empty. This is a pure function over the document value.
+  `{{field}}` and dotted `{{a.b}}` placeholders from the document; missing paths
+  render empty. This is a pure function over the document value, rendered by the
+  `minijinja` template engine (`{{...}}` Jinja2 syntax); a malformed template
+  fails the sink stage.
 - **Elasticsearch target.** Reuses `ElasticsearchConsumeSink` unchanged: the
   bulk `index` action already carries the float array into the mapped
   `dense_vector` field. `_id` derivation is unchanged (`--id-field` wins, then
@@ -176,7 +178,7 @@ the database, not how the decorator is implemented.
   response parsers for both Ollama and OpenAI shapes (happy path, empty
   embedding, malformed body). Prior art: `src/downstream/contract.rs`
   parsing tests.
-- **Template interpolation** — pure unit tests on `{field}` / dotted-path /
+- **Template interpolation** — pure unit tests on `{{field}}` / dotted-path /
   missing-field cases.
 - **`PostgresVectorConsumeSink`** — unit tests on the vector-literal rendering
   and the `id`-derivation fallback (explicit field wins, then message id).

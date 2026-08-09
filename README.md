@@ -540,11 +540,11 @@ pgx -U $DATABASE_URL consume \
   --index materials \
   --embed-url http://localhost:11434 \
   --embed-model bge-m3 \
-  --embed-template "{name}: {description}" \
+  --embed-template "{{name}}: {{description}}" \
   --embed-dim 1024
 ```
 
-Templates interpolate document fields with `{field}`; a missing field renders
+Templates interpolate document fields with `{{field}}`; a missing field renders
 empty. The default template embeds the whole `content` field.
 
 | Flag                   | Description                                        | Default      |
@@ -553,7 +553,7 @@ empty. The default template embeds the whole `content` field.
 | `--embed-api`          | API dialect: `ollama` or `openai`                  | `ollama`     |
 | `--embed-model`        | Model name (e.g. `bge-m3`, `text-embedding-3-small`) | —         |
 | `--embed-field`        | Document field the default template embeds         | `content`    |
-| `--embed-template`     | `{field}` template for the text to embed           | `{content}`  |
+| `--embed-template`     | `{{field}}` template for the text to embed         | `{{content}}`  |
 | `--embed-output-field` | Field the embedding vector is attached under       | `embedding`  |
 | `--embed-dim`          | Expected vector dimension (mismatches fail fast)   | unset        |
 

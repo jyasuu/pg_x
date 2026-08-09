@@ -6,7 +6,7 @@ Status: ready-for-agent
 **What to build:** A composed document whose template renders empty or
 whitespace-only text must fail the sink stage with a clear error instead of
 silently entering an infinite requeue loop. Today the default template is
-`{content}`; when the document has no such field the interpolated text is
+`{{content}}`; when the document has no such field the interpolated text is
 empty, and a real embedding API like Ollama responds HTTP 200 with
 `embeddings: []`, which surfaces as a confusing "embeddings is empty" error and
 is requeued forever under the lenient policy.

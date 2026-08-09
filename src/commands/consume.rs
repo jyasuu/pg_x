@@ -136,7 +136,7 @@ pub struct ConsumeArgs {
     /// Field embedded when no --embed-template is set (default "content")
     #[arg(long)]
     pub embed_field: Option<String>,
-    /// Template interpolating {field} / {a.b} from the composed document
+    /// Template interpolating {{field}} / {{a.b}} from the composed document
     #[arg(long)]
     pub embed_template: Option<String>,
     /// Document field receiving the vector (default "embedding")
@@ -308,7 +308,8 @@ impl ConsumeSink for EmbeddingSink {
     }
 
     async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
-        let text = interpolate(&self.template, doc);
+        let text = interpolate(&self.template, doc)
+            .with_context(|| format!("embedding template '{}' is invalid", self.template))?;
         if text.trim().is_empty() {
             bail!(
                 "embedding template '{0}' rendered empty text ({1} chars) — check the field it references",
@@ -1389,7 +1390,7 @@ mod embed_config_tests {
         assert_eq!(e.url, "http://localhost:11434");
         assert_eq!(e.model, "bge-m3");
         assert_eq!(e.api, EmbedApi::Ollama);
-        assert_eq!(e.template, "{content}");
+        assert_eq!(e.template, "{{content}}");
         assert_eq!(e.output_field, "embedding");
         assert_eq!(e.dim, None);
     }
@@ -1411,7 +1412,7 @@ mod embed_config_tests {
             .expect("active");
         assert_eq!(e.url, "http://ollama:11434");
         assert_eq!(e.api, EmbedApi::Openai);
-        assert_eq!(e.template, "{title}");
+        assert_eq!(e.template, "{{title}}");
         assert_eq!(e.output_field, "vec");
         assert_eq!(e.dim, Some(1536));
     }
@@ -1514,7 +1515,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder: embedder.clone(),
-            template: "{content}".to_string(),
+            template: "{{content}}".to_string(),
             output_field: "embedding".to_string(),
             dim: None,
         };
@@ -1543,7 +1544,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder: embedder.clone(),
-            template: "{content}\n-- {source} --".to_string(),
+            template: "{{content}}\n-- {{source}} --".to_string(),
             output_field: "embedding".to_string(),
             dim: None,
         };
@@ -1567,7 +1568,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder,
-            template: "{content}".to_string(),
+            template: "{{content}}".to_string(),
             output_field: "embedding".to_string(),
             dim: Some(3),
         };
@@ -1590,7 +1591,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder,
-            template: "{content}".to_string(),
+            template: "{{content}}".to_string(),
             output_field: "embedding".to_string(),
             dim: Some(3),
         };
@@ -1614,7 +1615,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder,
-            template: "{content}".to_string(),
+            template: "{{content}}".to_string(),
             output_field: "embedding".to_string(),
             dim: None,
         };
@@ -1622,7 +1623,7 @@ mod embedding_sink_tests {
         let doc = json!({ "name": "no content field" });
         let err = decorator.send(&doc, Some("m1")).await.unwrap_err();
         assert!(err.to_string().contains("empty text"), "{err}");
-        assert!(err.to_string().contains("{content}"), "{err}");
+        assert!(err.to_string().contains("{{content}}"), "{err}");
         assert!(inner.docs.lock().unwrap().is_empty());
     }
 
@@ -1638,7 +1639,7 @@ mod embedding_sink_tests {
         let decorator = EmbeddingSink {
             inner: inner.clone(),
             embedder,
-            template: "{content}".to_string(),
+            template: "{{content}}".to_string(),
             output_field: "embedding".to_string(),
             dim: None,
         };

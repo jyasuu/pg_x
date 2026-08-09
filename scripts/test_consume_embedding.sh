@@ -156,7 +156,7 @@ $PGX -U "$PGURL" consume \
   --index documents \
   --embed-url "$EMBED_URL" \
   --embed-model "$EMBED_MODEL" \
-  --embed-template "{name}" \
+  --embed-template "{{name}}" \
   --embed-dim "$EMBED_DIM" \
   --query-mode contract \
   --idempotent > /tmp/pgx_consume_embed.log 2>&1 &

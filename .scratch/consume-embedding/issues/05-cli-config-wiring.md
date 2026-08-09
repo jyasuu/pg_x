@@ -21,7 +21,7 @@ precedence and fail-fast startup validation (spec user stories 1–14, 18–20).
   `ConsumeConfig.vector_table: Option<String>`,
   `ConsumeSinkKind::PostgresVector { table: Option<String> }`.
 - `EffectiveEmbedConfig` merge: CLI wins over config, defaults
-  (api=ollama, field=content, template=`{content}`, output_field=embedding).
+  (api=ollama, field=content, template=`{{content}}`, output_field=embedding).
 - Sink resolution: CLI `--sink` list wins; else config `sink` +
   `additional_sinks`; else stdout. `build_sink` → `build_sinks` returning a
   single sink or a fan-out, then wrapped in `EmbeddingSink` when the embed

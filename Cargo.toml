@@ -49,6 +49,9 @@ toml = "0.8"
 url = "2"
 csv = "1"
 
+# Template engine for embeddable-text interpolation (consume --embed-template)
+minijinja = "2.23"
+
 # Async utilities
 async-trait = "0.1"
 futures = "0.3"

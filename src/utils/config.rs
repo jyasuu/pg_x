@@ -343,7 +343,7 @@ pub struct EmbedConfig {
     pub model: Option<String>,
     /// Field whose value is embedded when no template is set (default "content").
     pub field: Option<String>,
-    /// Template interpolating `{field}` / `{a.b}` from the document.
+    /// Template interpolating {{field}} / {{a.b}} from the document.
     pub template: Option<String>,
     /// Document field receiving the vector (default "embedding").
     pub output_field: Option<String>,
