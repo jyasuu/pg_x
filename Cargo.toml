@@ -100,13 +100,14 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 
 
 [features]
-default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv", "parquet"]
+default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv", "parquet", "embed"]
 excel = ["rust_xlsxwriter"]
 tls = ["tokio-postgres-rustls", "rustls", "tokio-rustls", "webpki-roots"]
 rabbitmq = ["lapin"]
 kafka = ["rdkafka"]
 webhook = ["dep:reqwest"]
 elasticsearch = ["dep:reqwest"]
+embed = ["dep:reqwest"]
 kv = ["redis"]
 parquet = ["dep:arrow", "dep:parquet"]
 iceberg = ["dep:iceberg", "parquet"]

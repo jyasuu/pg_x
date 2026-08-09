@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
 use serde_json::Value;
@@ -9,10 +9,13 @@ use tracing::{error, info};
 
 use crate::commands::consume_session::{Compose, ConsumeSession};
 use crate::consumer::r#trait::{ConsumeSink, Consumer};
+#[cfg(feature = "embed")]
+use crate::embed::EmbedClient;
+use crate::embed::{default_template, interpolate, Embed, EmbedApi};
 use crate::graphql::query::{NamedQuery, QueryLoader};
 use crate::graphql::{executor, pool::QueryConn, schema::SchemaRegistry};
 use crate::utils::config::{
-    Connection, ConsumeConfig, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig,
+    Connection, ConsumeConfig, ConsumeSinkKind, ConsumeSourceKind, EmbedConfig, ResolverConfig,
 };
 use crate::utils::session_loop::{self, ReconnectConfig, SessionExit};
 use crate::utils::signal::shutdown_signal;
@@ -25,9 +28,10 @@ pub struct ConsumeArgs {
     #[arg(long, value_enum, default_value_t = ConsumeSourceType::Rabbitmq)]
     pub source: ConsumeSourceType,
 
-    /// Sink type: stdout, elasticsearch, or webhook
-    #[arg(long, value_enum, default_value_t = ConsumeSinkType::Stdout)]
-    pub sink: ConsumeSinkType,
+    /// Sink type(s): stdout, elasticsearch, webhook, kv, or postgres-vector.
+    /// Repeatable; with more than one, the composed document fans out to all.
+    #[arg(long, value_enum)]
+    pub sink: Vec<ConsumeSinkType>,
 
     // ── Source: RabbitMQ ──
     #[arg(long, env = "AMQP_URL")]
@@ -116,6 +120,34 @@ pub struct ConsumeArgs {
     /// TTL in seconds (0 = no expiry)
     #[arg(long)]
     pub ttl: Option<u64>,
+
+    // ── Embedding stage ──
+    /// Embedding API base URL (e.g. http://localhost:11434). Enables the
+    /// embedding stage: each composed document is embedded and the vector is
+    /// attached before delivery.
+    #[arg(long, env = "EMBED_URL")]
+    pub embed_url: Option<String>,
+    /// Embedding wire format: ollama or openai (default ollama)
+    #[arg(long)]
+    pub embed_api: Option<String>,
+    /// Embedding model name (required when the stage is enabled)
+    #[arg(long)]
+    pub embed_model: Option<String>,
+    /// Field embedded when no --embed-template is set (default "content")
+    #[arg(long)]
+    pub embed_field: Option<String>,
+    /// Template interpolating {field} / {a.b} from the composed document
+    #[arg(long)]
+    pub embed_template: Option<String>,
+    /// Document field receiving the vector (default "embedding")
+    #[arg(long)]
+    pub embed_output_field: Option<String>,
+    /// Expected vector dimension; mismatches fail the sink stage
+    #[arg(long)]
+    pub embed_dim: Option<usize>,
+    /// Table name for the postgres-vector sink (default "chunk_embeddings")
+    #[arg(long)]
+    pub vector_table: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -131,6 +163,8 @@ pub enum ConsumeSinkType {
     Webhook,
     /// Key-value store (Redis / Memcached). Requires the 'kv' feature.
     Kv,
+    /// Upsert the document's embedding into a Postgres pgvector table.
+    PostgresVector,
 }
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
@@ -256,6 +290,132 @@ impl ConsumeSink for WebhookConsumeSink {
     }
 }
 
+/// Decorator that embeds each composed document and attaches the vector under
+/// `output_field` before forwarding to the wrapped sink. An embed failure is a
+/// sink-stage failure and obeys the consume session's existing error policy.
+struct EmbeddingSink {
+    inner: Arc<dyn ConsumeSink>,
+    embedder: Arc<dyn Embed>,
+    template: String,
+    output_field: String,
+    dim: Option<usize>,
+}
+
+#[async_trait]
+impl ConsumeSink for EmbeddingSink {
+    fn name(&self) -> &str {
+        "embedding"
+    }
+
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        let text = interpolate(&self.template, doc);
+        let vec = self.embedder.embed(&text).await?;
+        if let Some(dim) = self.dim {
+            if vec.len() != dim {
+                bail!(
+                    "embedding dimension mismatch: got {}, expected {}",
+                    vec.len(),
+                    dim
+                );
+            }
+        }
+        let mut enriched = doc.clone();
+        enriched[self.output_field.as_str()] = Value::from(vec);
+        self.inner.send(&enriched, msg_id).await
+    }
+}
+
+/// Fan-out delivery: forwards each document to every sink in order. The first
+/// failure short-circuits the rest.
+struct FanoutConsumeSink {
+    sinks: Vec<Arc<dyn ConsumeSink>>,
+}
+
+#[async_trait]
+impl ConsumeSink for FanoutConsumeSink {
+    fn name(&self) -> &str {
+        "fanout"
+    }
+
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        for sink in &self.sinks {
+            sink.send(doc, msg_id).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Upserts the document's embedding into a Postgres pgvector table
+/// (`id` + `embedding`), using the consume session's query pool.
+struct PostgresVectorConsumeSink {
+    pool: Arc<QueryConn>,
+    table: String,
+    id_field: Option<String>,
+    embedding_field: String,
+}
+
+impl PostgresVectorConsumeSink {
+    /// Derive the table `id` for a document: the explicit `--id-field` string
+    /// wins, then the message id (idempotent mode), then `None`.
+    fn doc_id(id_field: Option<&str>, doc: &Value, msg_id: Option<&str>) -> Option<String> {
+        let explicit = id_field.and_then(|idf| match doc {
+            Value::Object(m) => m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string())),
+            _ => None,
+        });
+        explicit.or_else(|| msg_id.map(|s| s.to_string()))
+    }
+
+    /// Render a float vector as a pgvector literal: `'[0.1,0.2,…]'::vector`.
+    fn vector_literal(v: &[f32]) -> String {
+        let nums: Vec<String> = v.iter().map(|f| f.to_string()).collect();
+        format!("'[{}]'::vector", nums.join(","))
+    }
+}
+
+#[async_trait]
+impl ConsumeSink for PostgresVectorConsumeSink {
+    fn name(&self) -> &str {
+        "postgres-vector"
+    }
+
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        let id = Self::doc_id(self.id_field.as_deref(), doc, msg_id).ok_or_else(|| {
+            anyhow!(
+                "postgres-vector sink needs a stable id — provide --id-field or run with --idempotent"
+            )
+        })?;
+        let embedding = doc
+            .get(self.embedding_field.as_str())
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                anyhow!(
+                    "document has no '{}' array; is the embedding stage enabled?",
+                    self.embedding_field
+                )
+            })?;
+        let floats: Vec<f32> = embedding
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow!("embedding contains a non-numeric value"))
+            })
+            .collect::<Result<_>>()?;
+        let literal = Self::vector_literal(&floats);
+        let sql = format!(
+            "INSERT INTO {} (id, embedding) VALUES ($1, $2::vector) \
+             ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
+            self.table
+        );
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id, &literal];
+        self.pool
+            .execute_cached(&sql, &params)
+            .await
+            .with_context(|| format!("pgvector upsert failed on table {}", self.table))?;
+        Ok(())
+    }
+}
+
 // ── KV sink (Redis / Memcached) ───────────────────────────────────────────────
 
 #[cfg(feature = "kv")]
@@ -263,64 +423,270 @@ use crate::consumer::kv::KvConsumeSink;
 
 // ── Builders ─────────────────────────────────────────────────────────────────
 
+/// Embedding-stage settings after merging CLI flags with connection-level
+/// config and defaults. `active` is true whenever an embedding URL was
+/// resolved, which wraps the delivery sink in [`EmbeddingSink`].
+struct EffectiveEmbedConfig {
+    url: String,
+    api: EmbedApi,
+    model: String,
+    template: String,
+    output_field: String,
+    dim: Option<usize>,
+}
+
+impl EffectiveEmbedConfig {
+    /// Merge CLI flags (win) with `consume.embed` config and defaults. `None`
+    /// when the stage is not configured at all. Fails fast on an embed
+    /// configuration that is present but incomplete (no URL, or no model).
+    fn resolve(cli: &ConsumeArgs, cfg: Option<&ConsumeConfig>) -> Result<Option<Self>> {
+        let embed_cfg: Option<&EmbedConfig> = cfg.and_then(|c| c.embed.as_ref());
+        let configured = cli.embed_url.is_some()
+            || cli.embed_api.is_some()
+            || cli.embed_model.is_some()
+            || cli.embed_field.is_some()
+            || cli.embed_template.is_some()
+            || cli.embed_output_field.is_some()
+            || cli.embed_dim.is_some()
+            || embed_cfg.is_some();
+
+        if !configured {
+            return Ok(None);
+        }
+
+        let url = cli
+            .embed_url
+            .clone()
+            .or_else(|| embed_cfg.and_then(|e| e.url.clone()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Embedding stage is configured but has no URL — provide --embed-url or consume.embed.url"
+                )
+            })?;
+        let model = cli
+            .embed_model
+            .clone()
+            .or_else(|| embed_cfg.and_then(|e| e.model.clone()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "--embed-url requires a model — provide --embed-model or consume.embed.model"
+                )
+            })?;
+        let api = cli
+            .embed_api
+            .as_deref()
+            .or_else(|| embed_cfg.and_then(|e| e.api.as_deref()))
+            .unwrap_or("ollama")
+            .parse::<EmbedApi>()
+            .map_err(anyhow::Error::msg)?;
+        let field = cli
+            .embed_field
+            .clone()
+            .or_else(|| embed_cfg.and_then(|e| e.field.clone()))
+            .unwrap_or_else(|| "content".to_string());
+        let template = cli
+            .embed_template
+            .clone()
+            .or_else(|| embed_cfg.and_then(|e| e.template.clone()))
+            .unwrap_or_else(|| default_template(&field));
+        let output_field = cli
+            .embed_output_field
+            .clone()
+            .or_else(|| embed_cfg.and_then(|e| e.output_field.clone()))
+            .unwrap_or_else(|| "embedding".to_string());
+        let dim = cli.embed_dim.or_else(|| embed_cfg.and_then(|e| e.dim));
+
+        Ok(Some(Self {
+            url,
+            api,
+            model,
+            template,
+            output_field,
+            dim,
+        }))
+    }
+}
+
+/// Resolve the delivery sink list: explicit CLI `--sink` flags win; else the
+/// connection's `sink` plus `additional_sinks`; else stdout.
+fn resolve_sink_kinds(args: &ConsumeArgs, cfg: Option<&ConsumeConfig>) -> Vec<ConsumeSinkKind> {
+    if !args.sink.is_empty() {
+        args.sink
+            .iter()
+            .map(|t| cli_sink_to_kind(args, t.clone()))
+            .collect()
+    } else if let Some(cfg) = cfg {
+        std::iter::once(cfg.sink.clone())
+            .chain(cfg.additional_sinks.iter().cloned())
+            .collect()
+    } else {
+        vec![ConsumeSinkKind::Stdout]
+    }
+}
+
+/// Map a CLI sink type to a config kind, pulling its options from the args.
+fn cli_sink_to_kind(args: &ConsumeArgs, t: ConsumeSinkType) -> ConsumeSinkKind {
+    match t {
+        ConsumeSinkType::Stdout => ConsumeSinkKind::Stdout,
+        ConsumeSinkType::Elasticsearch => ConsumeSinkKind::Elasticsearch {
+            url: args
+                .es_url
+                .clone()
+                .unwrap_or_else(|| "http://localhost:9200".to_string()),
+            index: args.index.clone().unwrap_or_else(|| "pgx".to_string()),
+            id_field: args.id_field.clone(),
+        },
+        ConsumeSinkType::Webhook => ConsumeSinkKind::Webhook {
+            url: args.webhook_url.clone().unwrap_or_default(),
+            headers: None,
+        },
+        ConsumeSinkType::Kv => ConsumeSinkKind::Kv {
+            url: args
+                .kv_url
+                .clone()
+                .unwrap_or_else(|| "redis://localhost:6379".to_string()),
+            key_field: args.key_field.clone(),
+            key_prefix: args.key_prefix.clone(),
+            ttl: args.ttl,
+        },
+        ConsumeSinkType::PostgresVector => ConsumeSinkKind::PostgresVector {
+            table: args.vector_table.clone(),
+        },
+    }
+}
+
+/// Build the delivery sinks for the resolved kind list (single sink, or a
+/// fan-out), then wrap them in the embedding decorator when the stage is
+/// active.
 #[allow(unused_variables)]
-async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
-    match args.sink {
-        ConsumeSinkType::Stdout => Ok(Arc::new(StdoutConsumeSink)),
+async fn build_sinks(
+    args: &ConsumeArgs,
+    cfg: Option<&ConsumeConfig>,
+    pool: Arc<QueryConn>,
+    embed: Option<&EffectiveEmbedConfig>,
+) -> Result<Arc<dyn ConsumeSink>> {
+    let kinds = resolve_sink_kinds(args, cfg);
+    let mut sinks = Vec::with_capacity(kinds.len());
+    for kind in &kinds {
+        sinks.push(build_one_sink(args, kind, cfg, &pool, embed).await?);
+    }
 
-        #[cfg(feature = "elasticsearch")]
-        ConsumeSinkType::Elasticsearch => {
-            let es_url = args.es_url.as_deref().unwrap_or("http://localhost:9200");
-            let index = args.index.as_deref().unwrap_or("pgx").to_string();
-            let es = crate::downstream::delivery::elasticsearch::Elasticsearch::new(es_url)?;
-            Ok(Arc::new(ElasticsearchConsumeSink {
-                index,
-                id_field: args.id_field.clone(),
-                es,
-            }))
-        }
+    let base: Arc<dyn ConsumeSink> = if sinks.len() == 1 {
+        sinks.pop().expect("one sink")
+    } else {
+        Arc::new(FanoutConsumeSink { sinks })
+    };
 
-        #[cfg(not(feature = "elasticsearch"))]
-        ConsumeSinkType::Elasticsearch => {
-            anyhow::bail!("Elasticsearch sink requires the 'elasticsearch' feature")
-        }
-
-        #[cfg(feature = "webhook")]
-        ConsumeSinkType::Webhook => {
-            let url = args.webhook_url.as_deref().unwrap_or_default();
-            if url.is_empty() {
-                anyhow::bail!(
-                    "Webhook URL is required — provide --webhook-url or set WEBHOOK_URL env"
-                );
+    match embed {
+        Some(e) => {
+            #[cfg(feature = "embed")]
+            {
+                Ok(Arc::new(EmbeddingSink {
+                    inner: base,
+                    embedder: Arc::new(EmbedClient::new(&e.url, e.api, &e.model)?),
+                    template: e.template.clone(),
+                    output_field: e.output_field.clone(),
+                    dim: e.dim,
+                }))
             }
-            let webhook = crate::downstream::delivery::webhook::Webhook::with_retries(0);
-            Ok(Arc::new(WebhookConsumeSink {
-                url: url.to_string(),
-                webhook,
+            #[cfg(not(feature = "embed"))]
+            {
+                anyhow::bail!("embedding stage requires the 'embed' feature")
+            }
+        }
+        None => Ok(base),
+    }
+}
+
+#[allow(unused_variables)]
+async fn build_one_sink(
+    args: &ConsumeArgs,
+    kind: &ConsumeSinkKind,
+    cfg: Option<&ConsumeConfig>,
+    pool: &Arc<QueryConn>,
+    embed: Option<&EffectiveEmbedConfig>,
+) -> Result<Arc<dyn ConsumeSink>> {
+    match kind {
+        ConsumeSinkKind::Stdout => Ok(Arc::new(StdoutConsumeSink)),
+
+        ConsumeSinkKind::Elasticsearch {
+            url,
+            index,
+            id_field,
+        } => {
+            #[cfg(feature = "elasticsearch")]
+            {
+                let es = crate::downstream::delivery::elasticsearch::Elasticsearch::new(url)?;
+                Ok(Arc::new(ElasticsearchConsumeSink {
+                    index: index.clone(),
+                    id_field: id_field.clone(),
+                    es,
+                }))
+            }
+            #[cfg(not(feature = "elasticsearch"))]
+            {
+                anyhow::bail!("Elasticsearch sink requires the 'elasticsearch' feature")
+            }
+        }
+
+        ConsumeSinkKind::Webhook { url, .. } => {
+            #[cfg(feature = "webhook")]
+            {
+                if url.is_empty() {
+                    anyhow::bail!(
+                        "Webhook URL is required — provide --webhook-url or set WEBHOOK_URL env"
+                    );
+                }
+                let webhook = crate::downstream::delivery::webhook::Webhook::with_retries(0);
+                Ok(Arc::new(WebhookConsumeSink {
+                    url: url.clone(),
+                    webhook,
+                }))
+            }
+            #[cfg(not(feature = "webhook"))]
+            {
+                anyhow::bail!("Webhook sink requires the 'webhook' feature")
+            }
+        }
+
+        ConsumeSinkKind::Kv {
+            url,
+            key_field,
+            key_prefix,
+            ttl,
+        } => {
+            #[cfg(feature = "kv")]
+            {
+                let sink = KvConsumeSink::connect(
+                    url,
+                    key_prefix.as_deref().unwrap_or("pgx:"),
+                    key_field.clone(),
+                    ttl.unwrap_or(0),
+                )
+                .await?;
+                Ok(Arc::new(sink))
+            }
+            #[cfg(not(feature = "kv"))]
+            {
+                anyhow::bail!("KV sink requires the 'kv' feature")
+            }
+        }
+
+        ConsumeSinkKind::PostgresVector { table } => {
+            let table = table
+                .clone()
+                .or_else(|| args.vector_table.clone())
+                .or_else(|| cfg.and_then(|c| c.vector_table.clone()))
+                .unwrap_or_else(|| "chunk_embeddings".to_string());
+            let embedding_field = embed
+                .map(|e| e.output_field.clone())
+                .unwrap_or_else(|| "embedding".to_string());
+            Ok(Arc::new(PostgresVectorConsumeSink {
+                pool: Arc::clone(pool),
+                table,
+                id_field: args.id_field.clone(),
+                embedding_field,
             }))
-        }
-
-        #[cfg(not(feature = "webhook"))]
-        ConsumeSinkType::Webhook => {
-            anyhow::bail!("Webhook sink requires the 'webhook' feature")
-        }
-
-        #[cfg(feature = "kv")]
-        ConsumeSinkType::Kv => {
-            let url = args.kv_url.as_deref().unwrap_or("redis://localhost:6379");
-            let sink = KvConsumeSink::connect(
-                url,
-                args.key_prefix.as_deref().unwrap_or("pgx:"),
-                args.key_field.clone(),
-                args.ttl.unwrap_or(0),
-            )
-            .await?;
-            Ok(Arc::new(sink))
-        }
-
-        #[cfg(not(feature = "kv"))]
-        ConsumeSinkType::Kv => {
-            anyhow::bail!("KV sink requires the 'kv' feature")
         }
     }
 }
@@ -480,9 +846,20 @@ pub async fn run(
             ConsumeSourceKind::Kafka { .. } => ConsumeSourceType::Kafka,
         };
         merge_source_config(&mut args, &cfg.source);
-        merge_sink_config(&mut args, &cfg.sink);
     }
     let eff = EffectiveConsumeConfig::merge(&args, cfg);
+
+    // ── Embedding stage: resolve once, before the session loop ──────────────
+    let eff_embed = EffectiveEmbedConfig::resolve(&args, cfg)?;
+    if eff_embed.is_none()
+        && resolve_sink_kinds(&args, cfg)
+            .iter()
+            .any(|k| matches!(k, ConsumeSinkKind::PostgresVector { .. }))
+    {
+        anyhow::bail!(
+            "postgres-vector sink requires the embedding stage — provide --embed-url (or consume.embed.url)"
+        );
+    }
 
     // Validate simple mode requires --query
     if matches!(eff.query_mode, ConsumeQueryMode::Simple) && eff.query.is_none() {
@@ -506,8 +883,9 @@ pub async fn run(
     // ── Resolve default query name (contract mode fallback) ──────────────────
     let default_query = eff.query.clone().unwrap_or_else(|| "default".to_string());
 
-    // ── Build sink (once) ────────────────────────────────────────────────────
-    let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
+    // ── Build sinks (once), wrapped in the embedding decorator if configured ─
+    let sink: Arc<dyn ConsumeSink> =
+        build_sinks(&args, cfg, pool.clone(), eff_embed.as_ref()).await?;
     info!("Using {} sink", sink.name());
 
     // ── Wire the composition seam to the GraphQL executor ────────────────────
@@ -607,62 +985,6 @@ fn merge_source_config(args: &mut ConsumeArgs, source: &ConsumeSourceKind) {
             if args.group_id.is_none() && group_id.is_some() {
                 args.group_id = group_id.clone();
             }
-        }
-    }
-}
-
-fn merge_sink_config(args: &mut ConsumeArgs, sink: &ConsumeSinkKind) {
-    match sink {
-        ConsumeSinkKind::Stdout => {
-            args.sink = ConsumeSinkType::Stdout;
-        }
-        ConsumeSinkKind::Elasticsearch {
-            url,
-            index,
-            id_field,
-        } => {
-            args.sink = ConsumeSinkType::Elasticsearch;
-            if args.es_url.is_none() {
-                args.es_url = Some(url.clone());
-            }
-            if args.index.is_none() {
-                args.index = Some(index.clone());
-            }
-            if args.id_field.is_none() {
-                args.id_field = id_field.clone();
-            }
-        }
-        ConsumeSinkKind::Webhook { url, .. } => {
-            args.sink = ConsumeSinkType::Webhook;
-            if args.webhook_url.is_none() {
-                args.webhook_url = Some(url.clone());
-            }
-        }
-        #[cfg(feature = "kv")]
-        ConsumeSinkKind::Kv {
-            url,
-            key_field,
-            key_prefix,
-            ttl,
-        } => {
-            args.sink = ConsumeSinkType::Kv;
-            if args.kv_url.is_none() {
-                args.kv_url = Some(url.clone());
-            }
-            if args.key_field.is_none() {
-                args.key_field = key_field.clone();
-            }
-            if args.key_prefix.is_none() {
-                args.key_prefix = key_prefix.clone();
-            }
-            if args.ttl.is_none() {
-                args.ttl = *ttl;
-            }
-        }
-        #[cfg(not(feature = "kv"))]
-        ConsumeSinkKind::Kv { .. } => {
-            // Cannot configure KV sink without the 'kv' feature;
-            // build_sink will produce a clear error.
         }
     }
 }
@@ -779,10 +1101,10 @@ mod effective_config_tests {
     use super::*;
     use crate::utils::config::{ConsumeConfig, ConsumeSinkKind, ConsumeSourceKind};
 
-    fn cli() -> ConsumeArgs {
+    pub(super) fn cli() -> ConsumeArgs {
         ConsumeArgs {
             source: ConsumeSourceType::Rabbitmq,
-            sink: ConsumeSinkType::Stdout,
+            sink: vec![],
             amqp_url: None,
             queue: None,
             exchange: None,
@@ -809,10 +1131,18 @@ mod effective_config_tests {
             key_field: None,
             key_prefix: None,
             ttl: None,
+            embed_url: None,
+            embed_api: None,
+            embed_model: None,
+            embed_field: None,
+            embed_template: None,
+            embed_output_field: None,
+            embed_dim: None,
+            vector_table: None,
         }
     }
 
-    fn cfg() -> ConsumeConfig {
+    pub(super) fn cfg() -> ConsumeConfig {
         ConsumeConfig {
             source: ConsumeSourceKind::Rabbitmq {
                 amqp_url: None,
@@ -829,6 +1159,9 @@ mod effective_config_tests {
             on_error: Some("lenient".to_string()),
             idempotent: Some(true),
             dedup_ttl: Some(60),
+            embed: None,
+            additional_sinks: vec![],
+            vector_table: None,
         }
     }
 
@@ -886,42 +1219,355 @@ mod effective_config_tests {
         let eff = EffectiveConsumeConfig::merge(&c, Some(&cfg()));
         assert_eq!(eff.max_depth, 8);
     }
+}
 
-    #[cfg(feature = "kv")]
+#[cfg(test)]
+mod sink_resolution_tests {
+    use super::effective_config_tests::{cfg, cli};
+    use super::*;
+
     #[test]
-    fn kv_sink_explicit_cli_wins_over_config() {
-        let mut c = cli();
-        c.key_prefix = Some("cli:".to_string());
-        c.ttl = Some(0);
-        merge_sink_config(
-            &mut c,
-            &ConsumeSinkKind::Kv {
-                url: "redis://x".to_string(),
-                key_field: None,
-                key_prefix: Some("cfg:".to_string()),
-                ttl: Some(60),
-            },
+    fn defaults_to_stdout_without_cli_or_config() {
+        assert_eq!(
+            resolve_sink_kinds(&cli(), None),
+            vec![ConsumeSinkKind::Stdout]
         );
-        // Explicit `--ttl 0` / `--key-prefix cli:` are no longer mistaken for
-        // the clap defaults and silently overridden by config.
-        assert_eq!(c.key_prefix.as_deref(), Some("cli:"));
-        assert_eq!(c.ttl, Some(0));
     }
 
-    #[cfg(feature = "kv")]
     #[test]
-    fn kv_sink_config_fills_when_cli_absent() {
+    fn cli_sinks_win_over_config() {
         let mut c = cli();
-        merge_sink_config(
-            &mut c,
-            &ConsumeSinkKind::Kv {
-                url: "redis://x".to_string(),
-                key_field: None,
-                key_prefix: Some("cfg:".to_string()),
-                ttl: Some(60),
-            },
+        c.sink = vec![ConsumeSinkType::Elasticsearch];
+        assert_eq!(
+            resolve_sink_kinds(&c, Some(&cfg())),
+            vec![ConsumeSinkKind::Elasticsearch {
+                url: "http://localhost:9200".to_string(),
+                index: "pgx".to_string(),
+                id_field: None,
+            }]
         );
-        assert_eq!(c.key_prefix.as_deref(), Some("cfg:"));
-        assert_eq!(c.ttl, Some(60));
+    }
+
+    #[test]
+    fn config_sink_plus_additional_sinks_when_no_cli() {
+        let mut c = cfg();
+        c.additional_sinks = vec![ConsumeSinkKind::PostgresVector { table: None }];
+        assert_eq!(
+            resolve_sink_kinds(&cli(), Some(&c)),
+            vec![
+                ConsumeSinkKind::Stdout,
+                ConsumeSinkKind::PostgresVector { table: None }
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_postgres_vector_carries_vector_table() {
+        let mut c = cli();
+        c.sink = vec![ConsumeSinkType::PostgresVector];
+        c.vector_table = Some("embeddings".to_string());
+        assert_eq!(
+            resolve_sink_kinds(&c, None),
+            vec![ConsumeSinkKind::PostgresVector {
+                table: Some("embeddings".to_string())
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod embed_config_tests {
+    use super::effective_config_tests::{cfg, cli};
+    use super::*;
+    use crate::embed::EmbedApi;
+    use crate::utils::config::EmbedConfig;
+
+    #[test]
+    fn not_configured_is_none() {
+        assert!(EffectiveEmbedConfig::resolve(&cli(), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn url_and_model_from_cli() {
+        let mut c = cli();
+        c.embed_url = Some("http://localhost:11434".to_string());
+        c.embed_model = Some("bge-m3".to_string());
+        let e = EffectiveEmbedConfig::resolve(&c, None)
+            .unwrap()
+            .expect("active");
+        assert_eq!(e.url, "http://localhost:11434");
+        assert_eq!(e.model, "bge-m3");
+        assert_eq!(e.api, EmbedApi::Ollama);
+        assert_eq!(e.template, "{content}");
+        assert_eq!(e.output_field, "embedding");
+        assert_eq!(e.dim, None);
+    }
+
+    #[test]
+    fn config_fills_when_cli_absent() {
+        let mut cfg = cfg();
+        cfg.embed = Some(EmbedConfig {
+            url: Some("http://ollama:11434".to_string()),
+            api: Some("openai".to_string()),
+            model: Some("text-embedding-3-small".to_string()),
+            field: Some("title".to_string()),
+            output_field: Some("vec".to_string()),
+            dim: Some(1536),
+            ..EmbedConfig::default()
+        });
+        let e = EffectiveEmbedConfig::resolve(&cli(), Some(&cfg))
+            .unwrap()
+            .expect("active");
+        assert_eq!(e.url, "http://ollama:11434");
+        assert_eq!(e.api, EmbedApi::Openai);
+        assert_eq!(e.template, "{title}");
+        assert_eq!(e.output_field, "vec");
+        assert_eq!(e.dim, Some(1536));
+    }
+
+    #[test]
+    fn cli_wins_over_config() {
+        let mut c = cli();
+        c.embed_url = Some("http://cli:11434".to_string());
+        c.embed_model = Some("cli-model".to_string());
+        c.embed_api = Some("openai".to_string());
+        c.embed_dim = Some(512);
+        let mut cfg = cfg();
+        cfg.embed = Some(EmbedConfig {
+            url: Some("http://cfg:11434".to_string()),
+            api: Some("ollama".to_string()),
+            model: Some("cfg-model".to_string()),
+            dim: Some(1024),
+            ..EmbedConfig::default()
+        });
+        let e = EffectiveEmbedConfig::resolve(&c, Some(&cfg))
+            .unwrap()
+            .expect("active");
+        assert_eq!(e.url, "http://cli:11434");
+        assert_eq!(e.model, "cli-model");
+        assert_eq!(e.api, EmbedApi::Openai);
+        assert_eq!(e.dim, Some(512));
+    }
+
+    #[test]
+    fn url_without_model_fails_fast() {
+        let mut c = cli();
+        c.embed_url = Some("http://localhost:11434".to_string());
+        assert!(EffectiveEmbedConfig::resolve(&c, None).is_err());
+    }
+
+    #[test]
+    fn embed_section_without_url_fails_fast() {
+        let mut cfg = cfg();
+        cfg.embed = Some(EmbedConfig {
+            model: Some("bge-m3".to_string()),
+            ..EmbedConfig::default()
+        });
+        assert!(EffectiveEmbedConfig::resolve(&cli(), Some(&cfg)).is_err());
+    }
+
+    #[test]
+    fn invalid_api_fails_fast() {
+        let mut c = cli();
+        c.embed_url = Some("http://localhost:11434".to_string());
+        c.embed_model = Some("bge-m3".to_string());
+        c.embed_api = Some("azure".to_string());
+        assert!(EffectiveEmbedConfig::resolve(&c, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod embedding_sink_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct FakeEmbed {
+        out: Vec<f32>,
+        recorded: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Embed for FakeEmbed {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.recorded.lock().unwrap().push(text.to_string());
+            Ok(self.out.clone())
+        }
+    }
+
+    struct RecordingSink {
+        docs: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl ConsumeSink for RecordingSink {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        async fn send(&self, doc: &Value, _msg_id: Option<&str>) -> Result<()> {
+            self.docs.lock().unwrap().push(doc.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn attaches_vector_under_output_field() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![0.1, 0.2],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder: embedder.clone(),
+            template: "{content}".to_string(),
+            output_field: "embedding".to_string(),
+            dim: None,
+        };
+
+        let doc = json!({ "content": "premium cotton" });
+        decorator.send(&doc, Some("m1")).await.unwrap();
+
+        let received = &inner.docs.lock().unwrap()[0];
+        // serde_json renders f32 through f64, so compare with the same
+        // representation rather than decimal f64 literals.
+        assert_eq!(received["embedding"], json!([0.1f32, 0.2f32]));
+        assert_eq!(received["content"], "premium cotton");
+        // The original document is not mutated by the decorator.
+        assert!(doc.get("embedding").is_none());
+    }
+
+    #[tokio::test]
+    async fn template_selects_the_embedded_text() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![1.0],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder: embedder.clone(),
+            template: "{content}\n-- {source} --".to_string(),
+            output_field: "embedding".to_string(),
+            dim: None,
+        };
+
+        let doc = json!({ "content": "hello", "source": "catalog" });
+        decorator.send(&doc, Some("m1")).await.unwrap();
+
+        let recorded = embedder.recorded.lock().unwrap();
+        assert_eq!(*recorded, vec!["hello\n-- catalog --"]);
+    }
+
+    #[tokio::test]
+    async fn dimension_mismatch_fails_the_sink_stage() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![0.1, 0.2],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder,
+            template: "{content}".to_string(),
+            output_field: "embedding".to_string(),
+            dim: Some(3),
+        };
+
+        let doc = json!({ "content": "hello" });
+        assert!(decorator.send(&doc, Some("m1")).await.is_err());
+        // The inner sink must not be reached on a dim mismatch.
+        assert!(inner.docs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dimension_match_passes() {
+        let embedder = Arc::new(FakeEmbed {
+            out: vec![0.1, 0.2, 0.3],
+            recorded: Mutex::new(Vec::new()),
+        });
+        let inner = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let decorator = EmbeddingSink {
+            inner: inner.clone(),
+            embedder,
+            template: "{content}".to_string(),
+            output_field: "embedding".to_string(),
+            dim: Some(3),
+        };
+
+        decorator
+            .send(&json!({ "content": "hello" }), Some("m1"))
+            .await
+            .unwrap();
+        assert_eq!(inner.docs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_delivers_to_every_sink() {
+        let a = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let b = Arc::new(RecordingSink {
+            docs: Mutex::new(Vec::new()),
+        });
+        let fanout = FanoutConsumeSink {
+            sinks: vec![a.clone(), b.clone()],
+        };
+        fanout.send(&json!({ "x": 1 }), None).await.unwrap();
+        assert_eq!(a.docs.lock().unwrap().len(), 1);
+        assert_eq!(b.docs.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod postgres_vector_sink_tests {
+    use super::PostgresVectorConsumeSink;
+    use serde_json::json;
+
+    #[test]
+    fn doc_id_explicit_field_wins() {
+        let doc = json!({ "id": "doc-1", "content": "x" });
+        assert_eq!(
+            PostgresVectorConsumeSink::doc_id(Some("id"), &doc, Some("m1")),
+            Some("doc-1".to_string())
+        );
+    }
+
+    #[test]
+    fn doc_id_falls_back_to_msg_id() {
+        let doc = json!({ "content": "x" });
+        assert_eq!(
+            PostgresVectorConsumeSink::doc_id(Some("id"), &doc, Some("m1")),
+            Some("m1".to_string())
+        );
+        assert_eq!(
+            PostgresVectorConsumeSink::doc_id(None, &doc, Some("m1")),
+            Some("m1".to_string())
+        );
+    }
+
+    #[test]
+    fn doc_id_none_without_key() {
+        let doc = json!({ "content": "x" });
+        assert_eq!(PostgresVectorConsumeSink::doc_id(None, &doc, None), None);
+    }
+
+    #[test]
+    fn vector_literal_rendering() {
+        assert_eq!(
+            PostgresVectorConsumeSink::vector_literal(&[0.1, 0.2, 1.0]),
+            "'[0.1,0.2,1]'::vector"
+        );
     }
 }

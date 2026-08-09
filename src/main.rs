@@ -1,6 +1,7 @@
 mod commands;
 mod consumer;
 mod downstream;
+mod embed;
 mod graphql;
 mod replication;
 mod utils;

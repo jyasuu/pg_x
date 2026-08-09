@@ -94,6 +94,39 @@ impl QueryConn {
         Ok(rows)
     }
 
+    /// Execute a non-SELECT statement (INSERT/UPDATE/DELETE) using a prepared
+    /// statement cache, returning the affected row count. Mirrors
+    /// [`Self::query_cached`] for write statements.
+    pub async fn execute_cached(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<u64> {
+        if self.clients.is_empty() {
+            anyhow::bail!("connection pool is empty");
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        let (client, cache) = &self.clients[idx];
+
+        let stmt = {
+            let guard = cache.lock().unwrap();
+            guard.get(sql).cloned()
+        };
+
+        let stmt = match stmt {
+            Some(s) => s,
+            None => {
+                let s = client.prepare(sql).await?;
+                let mut guard = cache.lock().unwrap();
+                guard.insert(sql.to_string(), s.clone());
+                s
+            }
+        };
+
+        let affected = client.execute(&stmt, params).await?;
+        Ok(affected)
+    }
+
     /// Number of connections in the pool.
     #[allow(dead_code)]
     pub fn size(&self) -> usize {

@@ -268,6 +268,16 @@ pub struct ConsumeConfig {
     /// How long (seconds) to remember seen message ids for dedupe.
     #[serde(default)]
     pub dedup_ttl: Option<u64>,
+    /// Embedding-stage options; when present the sink is wrapped in the
+    /// embedding decorator.
+    #[serde(default)]
+    pub embed: Option<EmbedConfig>,
+    /// Additional sinks for fan-out alongside `sink`.
+    #[serde(default)]
+    pub additional_sinks: Vec<ConsumeSinkKind>,
+    /// Default table name for `postgres-vector` sinks.
+    #[serde(default)]
+    pub vector_table: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,7 +298,7 @@ pub enum ConsumeSourceKind {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConsumeSinkKind {
     /// Print the composed document as JSON to stdout.
@@ -315,6 +325,30 @@ pub enum ConsumeSinkKind {
         /// TTL in seconds (0 = no expiry).
         ttl: Option<u64>,
     },
+    /// Upsert the document's `embedding` field into a Postgres pgvector table.
+    PostgresVector {
+        /// Table name (default `chunk_embeddings`).
+        table: Option<String>,
+    },
+}
+
+/// Embedding-stage options for the `consume` command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbedConfig {
+    /// Embedding API base URL (e.g. http://localhost:11434).
+    pub url: Option<String>,
+    /// Wire format: "ollama" or "openai" (default "ollama").
+    pub api: Option<String>,
+    /// Model name passed to the embedding API.
+    pub model: Option<String>,
+    /// Field whose value is embedded when no template is set (default "content").
+    pub field: Option<String>,
+    /// Template interpolating `{field}` / `{a.b}` from the document.
+    pub template: Option<String>,
+    /// Document field receiving the vector (default "embedding").
+    pub output_field: Option<String>,
+    /// Expected vector dimension; mismatches fail the sink stage.
+    pub dim: Option<usize>,
 }
 
 /// Merge a CLI Option field from a config Option (CLI wins).
