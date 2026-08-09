@@ -1,4 +1,6 @@
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "embed")]
+use anyhow::bail;
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
 use serde_json::Value;
@@ -9,9 +11,9 @@ use tracing::{error, info, warn};
 
 use crate::commands::consume_session::{Compose, ConsumeSession};
 use crate::consumer::r#trait::{ConsumeSink, Consumer};
+use crate::embed::{default_template, EmbedApi};
 #[cfg(feature = "embed")]
-use crate::embed::EmbedClient;
-use crate::embed::{default_template, interpolate, Embed, EmbedApi};
+use crate::embed::{interpolate, Embed, EmbedClient};
 use crate::graphql::query::{NamedQuery, QueryLoader};
 use crate::graphql::{executor, pool::QueryConn, schema::SchemaRegistry};
 use crate::utils::config::{
@@ -293,6 +295,7 @@ impl ConsumeSink for WebhookConsumeSink {
 /// Decorator that embeds each composed document and attaches the vector under
 /// `output_field` before forwarding to the wrapped sink. An embed failure is a
 /// sink-stage failure and obeys the consume session's existing error policy.
+#[cfg(feature = "embed")]
 struct EmbeddingSink {
     inner: Arc<dyn ConsumeSink>,
     embedder: Arc<dyn Embed>,
@@ -301,6 +304,7 @@ struct EmbeddingSink {
     dim: Option<usize>,
 }
 
+#[cfg(feature = "embed")]
 #[async_trait]
 impl ConsumeSink for EmbeddingSink {
     fn name(&self) -> &str {
@@ -462,6 +466,9 @@ use crate::consumer::kv::KvConsumeSink;
 /// Embedding-stage settings after merging CLI flags with connection-level
 /// config and defaults. `active` is true whenever an embedding URL was
 /// resolved, which wraps the delivery sink in [`EmbeddingSink`].
+/// The fields are only read by the `embed`-gated sink wrapper, so they appear
+/// dead in a `--no-default-features` build.
+#[allow(dead_code)]
 struct EffectiveEmbedConfig {
     url: String,
     api: EmbedApi,
@@ -1468,7 +1475,7 @@ mod embed_config_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod embedding_sink_tests {
     use super::*;
     use serde_json::json;

@@ -6,10 +6,11 @@
 //! unit-tested without a live server. The HTTP transport ([`EmbedClient`]) is
 //! gated behind the `embed` feature.
 
-use anyhow::{anyhow, Result};
 #[cfg(feature = "embed")]
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "embed")]
 use async_trait::async_trait;
+#[cfg(feature = "embed")]
 use serde_json::{json, Value};
 
 /// The embedding API wire format.
@@ -45,6 +46,7 @@ impl std::fmt::Display for EmbedApi {
 
 /// An embedding provider. A sink-stage failure surfaces as `Err` and obeys the
 /// consume session's existing error policy.
+#[cfg(feature = "embed")]
 #[async_trait]
 pub trait Embed: Send + Sync {
     /// Embed `text`, returning the float vector.
@@ -54,16 +56,19 @@ pub trait Embed: Send + Sync {
 // ── Pure wire-format builders and parsers ────────────────────────────────────
 
 /// Ollama `/api/embed` request body.
+#[cfg(feature = "embed")]
 pub fn ollama_request(model: &str, text: &str) -> Value {
     json!({ "model": model, "input": text })
 }
 
 /// OpenAI-compatible `/v1/embeddings` request body.
+#[cfg(feature = "embed")]
 pub fn openai_request(model: &str, text: &str) -> Value {
     json!({ "model": model, "input": text })
 }
 
 /// Parse an Ollama `/api/embed` response body into the first embedding.
+#[cfg(feature = "embed")]
 pub fn parse_ollama_response(body: &Value) -> Result<Vec<f32>> {
     let embeddings = body
         .get("embeddings")
@@ -77,6 +82,7 @@ pub fn parse_ollama_response(body: &Value) -> Result<Vec<f32>> {
 
 /// Parse an OpenAI-compatible `/v1/embeddings` response body into the first
 /// embedding.
+#[cfg(feature = "embed")]
 pub fn parse_openai_response(body: &Value) -> Result<Vec<f32>> {
     let data = body
         .get("data")
@@ -91,6 +97,7 @@ pub fn parse_openai_response(body: &Value) -> Result<Vec<f32>> {
     parse_float_array(embedding)
 }
 
+#[cfg(feature = "embed")]
 fn parse_float_array(value: &Value) -> Result<Vec<f32>> {
     let arr = value
         .as_array()
@@ -168,6 +175,7 @@ impl Embed for EmbedClient {
 /// Interpolate a Jinja2 template (`{{field}}`, dotted `{{a.b}}`) from `doc`.
 /// Missing paths render empty; non-placeholder text is preserved. Fails only
 /// when the template itself is malformed.
+#[cfg(feature = "embed")]
 pub fn interpolate(template: &str, doc: &Value) -> Result<String> {
     minijinja::Environment::new()
         .render_str(template, doc)
@@ -179,7 +187,7 @@ pub fn default_template(field: &str) -> String {
     format!("{{{{{field}}}}}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod wire_format_tests {
     use super::*;
     use serde_json::json;
@@ -240,7 +248,7 @@ mod wire_format_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod template_tests {
     use super::*;
     use serde_json::json;
@@ -255,7 +263,10 @@ mod template_tests {
 
     #[test]
     fn plain_field() {
-        assert_eq!(interpolate("{{content}}", &doc()).unwrap(), "premium cotton");
+        assert_eq!(
+            interpolate("{{content}}", &doc()).unwrap(),
+            "premium cotton"
+        );
     }
 
     #[test]
