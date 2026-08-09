@@ -365,10 +365,25 @@ impl PostgresVectorConsumeSink {
         explicit.or_else(|| msg_id.map(|s| s.to_string()))
     }
 
-    /// Render a float vector as a pgvector literal: `'[0.1,0.2,…]'::vector`.
+    /// Render a float vector as a pgvector literal: `[0.1,0.2,…]`. The caller
+    /// binds it as a text parameter cast to `vector` at the SQL level
+    /// (`$2::text::vector`), so the value must be the bare array without
+    /// quotes or a cast suffix.
     fn vector_literal(v: &[f32]) -> String {
         let nums: Vec<String> = v.iter().map(|f| f.to_string()).collect();
-        format!("'[{}]'::vector", nums.join(","))
+        format!("[{}]", nums.join(","))
+    }
+
+    /// The upsert statement. The vector is bound as a `text` parameter and
+    /// cast via `$2::text::vector`: binding it as a `vector` parameter
+    /// directly fails client-side, because tokio-postgres rejects a `String`
+    /// value for a non-text parameter type.
+    fn upsert_sql(table: &str) -> String {
+        format!(
+            "INSERT INTO {} (id, embedding) VALUES ($1, $2::text::vector) \
+             ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
+            table
+        )
     }
 }
 
@@ -402,11 +417,7 @@ impl ConsumeSink for PostgresVectorConsumeSink {
             })
             .collect::<Result<_>>()?;
         let literal = Self::vector_literal(&floats);
-        let sql = format!(
-            "INSERT INTO {} (id, embedding) VALUES ($1, $2::vector) \
-             ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
-            self.table
-        );
+        let sql = Self::upsert_sql(&self.table);
         let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id, &literal];
         self.pool
             .execute_cached(&sql, &params)
@@ -1567,7 +1578,17 @@ mod postgres_vector_sink_tests {
     fn vector_literal_rendering() {
         assert_eq!(
             PostgresVectorConsumeSink::vector_literal(&[0.1, 0.2, 1.0]),
-            "'[0.1,0.2,1]'::vector"
+            "[0.1,0.2,1]"
         );
+    }
+
+    #[test]
+    fn upsert_sql_binds_vector_as_text_param() {
+        // The vector must be bound as `$2::text::vector`; declaring the param
+        // as `vector` makes tokio-postgres reject the String binding with a
+        // client-side serialization error.
+        let sql = PostgresVectorConsumeSink::upsert_sql("chunk_embeddings");
+        assert!(sql.contains("VALUES ($1, $2::text::vector)"));
+        assert!(sql.contains("ON CONFLICT (id) DO UPDATE"));
     }
 }

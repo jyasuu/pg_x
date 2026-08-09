@@ -62,6 +62,7 @@ echo "==> consume-embedding: setting up schema directory"
 mkdir -p ~/.pgx/schema ~/.pgx/queries
 cp -r examples/graphql/pgx/schema/* ~/.pgx/schema/
 cp -r examples/graphql/pgx/queries/* ~/.pgx/queries/
+[ -f ~/.pgx/config.toml ] || cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
 
 echo "==> consume-embedding: seeding documents + chunk_embeddings schema"
 psql "$PGURL" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
@@ -98,7 +99,7 @@ CREATE=$(curl -s -X PUT "$ES_URL/documents" -H 'Content-Type: application/json' 
     "embedding": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" }
   } }
 }')
-if echo "$CREATE" | grep -q "ik_max_word not found"; then
+if echo "$CREATE" | grep -q '"error"'; then
   curl -s -X PUT "$ES_URL/documents" -H 'Content-Type: application/json' -d '{
     "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
     "mappings": { "properties": {
@@ -155,7 +156,7 @@ $PGX -U "$PGURL" consume \
   --index documents \
   --embed-url "$EMBED_URL" \
   --embed-model "$EMBED_MODEL" \
-  --embed-template "{material.name}" \
+  --embed-template "{name}" \
   --embed-dim "$EMBED_DIM" \
   --query-mode contract \
   --idempotent > /tmp/pgx_consume_embed.log 2>&1 &
@@ -185,7 +186,7 @@ d = json.load(sys.stdin)
 src = d['_source']
 emb = src.get('embedding')
 assert isinstance(emb, list) and len(emb) == 1024, f'embedding missing or wrong dim: {src.get(\"embedding\")}'
-assert src.get('material', {}).get('name') == 'Premium Cotton Canvas', src.get('material')
+assert src.get('name') == 'Premium Cotton Canvas', src.get('name')
 print('==> consume-embedding: ES document carries a 1024-dim embedding')
 "
 
