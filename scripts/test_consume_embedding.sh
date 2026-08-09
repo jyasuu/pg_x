@@ -224,6 +224,9 @@ if ! wait_for_es_doc; then
 fi
 echo "==> consume-embedding: ES document carries a 1024-dim embedding"
 
+# Real-time GETs (wait_for_es_doc) see a doc before the periodic refresh, but
+# _count is a search — force a refresh so the count is not stale.
+curl -s -X POST "$ES_URL/documents/_refresh" >/dev/null
 ES_COUNT=$(curl -s "$ES_URL/documents/_count" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
 [ "$ES_COUNT" = "1" ] || fail_verify "expected 1 ES document, got $ES_COUNT"
@@ -240,6 +243,7 @@ publish_once
 if ! wait_for_es_doc || ! wait_for_pg_row; then
   fail_verify "idempotent re-publish failed to land the doc and row"
 fi
+curl -s -X POST "$ES_URL/documents/_refresh" >/dev/null
 ES_COUNT2=$(curl -s "$ES_URL/documents/_count" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
 PG_COUNT2=$(psql -At "$PGURL" -c "SELECT count(*) FROM chunk_embeddings WHERE id = '$DOC_ID';")
