@@ -547,6 +547,15 @@ pgx -U $DATABASE_URL consume \
 Templates interpolate document fields with `{{field}}`; a missing field renders
 empty. The default template embeds the whole `content` field.
 
+A built-in `toon()` function serializes values to TOON (Token-Oriented Object
+Notation) — a compact, LLM-friendly format. Use `{{ toon(doc) }}` for the whole
+document or `{{ toon(field) }}` for a sub-field:
+
+```bash
+--embed-template "Material {{name}}:\n{{ toon(sizes) }}"
+--embed-template "{{ toon(doc) }}"
+```
+
 | Flag                   | Description                                        | Default      |
 | ---------------------- | -------------------------------------------------- | ------------ |
 | `--embed-url`          | Embedding API base URL (Ollama or OpenAI-style)    | — (enables the stage) |
