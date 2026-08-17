@@ -52,6 +52,9 @@ csv = "1"
 # Template engine for embeddable-text interpolation (consume --embed-template)
 minijinja = "2.23"
 
+# TOON (Token-Oriented Object Notation) serialization for embed templates
+toon-format = "0.5"
+
 # Async utilities
 async-trait = "0.1"
 futures = "0.3"

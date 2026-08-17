@@ -175,10 +175,23 @@ impl Embed for EmbedClient {
 /// Interpolate a Jinja2 template (`{{field}}`, dotted `{{a.b}}`) from `doc`.
 /// Missing paths render empty; non-placeholder text is preserved. Fails only
 /// when the template itself is malformed.
+///
+/// A built-in `toon(value)` function serializes any JSON value to TOON format:
+/// `{{ toon(field) }}` serializes a sub-field; `{{ toon(doc) }}` serializes the
+/// whole document (exposed via the implicit `doc` variable).
 #[cfg(feature = "embed")]
 pub fn interpolate(template: &str, doc: &Value) -> Result<String> {
-    minijinja::Environment::new()
-        .render_str(template, doc)
+    let mut env = minijinja::Environment::new();
+    env.add_function(
+        "toon",
+        |value: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
+            toon_format::encode(&value, &toon_format::EncodeOptions::default()).map_err(|e| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+            })
+        },
+    );
+    env.add_global("doc", minijinja::Value::from_serialize(doc));
+    env.render_str(template, doc)
         .map_err(|e| anyhow!("invalid embed template: {e}"))
 }
 
@@ -307,5 +320,33 @@ mod template_tests {
     #[test]
     fn default_template_is_field() {
         assert_eq!(default_template("content"), "{{content}}");
+    }
+
+    #[test]
+    fn toon_serializes_field() {
+        let doc = json!({ "sizes": [10, 20, 30] });
+        let result = interpolate("{{ toon(sizes) }}", &doc).unwrap();
+        assert!(result.contains("10"));
+        assert!(result.contains("20"));
+        assert!(result.contains("30"));
+    }
+
+    #[test]
+    fn toon_serializes_whole_document() {
+        let doc = json!({ "name": "test", "count": 42 });
+        let result = interpolate("{{ toon(doc) }}", &doc).unwrap();
+        assert!(result.contains("name: test"));
+        assert!(result.contains("count: 42"));
+    }
+
+    #[test]
+    fn toon_mixed_with_text() {
+        let doc = json!({
+            "name": "premium cotton",
+            "attributes": { "weight": 180, "organic": true }
+        });
+        let result = interpolate("Material: {{name}}\n{{ toon(attributes) }}", &doc).unwrap();
+        assert!(result.starts_with("Material: premium cotton"));
+        assert!(result.contains("weight: 180"));
     }
 }
