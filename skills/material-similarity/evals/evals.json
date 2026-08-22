@@ -1,0 +1,23 @@
+{
+  "skill_name": "material-similarity",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We suspect our ERP materials table has lots of duplicates — different people entered the same bolt or bearing over the years under slightly different descriptions. Can you find them and give me a file with the candidate duplicate pairs?",
+      "expected_output": "Runs the SOP: verifies/embeds the materials table into chunk_embeddings (real embedding endpoint if configured, mock otherwise), runs find_similar_materials.sh to produce a JSONL dataset, and filters candidates on matched_fields containing part_no before presenting results.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Generate some realistic sample material data with known duplicates baked in so I can demo the dedup pipeline to my team. Keep it small enough to run in a few minutes.",
+      "expected_output": "Runs seed_materials.py with a reduced ROWS value (e.g. ROWS=2000) and non-default DUPE_PCT, reports the injected cluster counts, and explains that variants share brand/part_no/spec/dims with corrupted descriptions.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Our Ollama box is at http://gpu-box.lan:11434 with bge-m3 pulled. Embed our whole materials catalog into postgres so we can do similarity search on it later.",
+      "expected_output": "Exports RAG_MCP_OLLAMA_URL=http://gpu-box.lan:11434, verifies the model via /api/tags before running, then runs embed_materials.sh (which wraps backfill_embedding.sh) landing one 1024-dim vector per material row into chunk_embeddings via the postgres-vector sink.",
+      "files": []
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 ---
 name: material-similarity
-description: Use this skill when the user wants to find duplicate or near-duplicate material master data (ERP MDM dedup / entity resolution on materials), generate large synthetic sample material data with injected duplicates, embed Postgres rows into pgvector through the pgx embedding pipeline, or produce a dataset of similar material pairs. Trigger on mentions of duplicate materials, similar/duplicate master data, material master dedup, entity resolution for materials, pgvector similarity over chunk_embeddings, bge-m3 embeddings of materials, or running the material-similarity SOP.
+description: Find duplicate or near-duplicate material master data (ERP MDM dedup / entity resolution on materials) using embeddings and pgvector. Use this skill whenever the user wants to detect duplicate materials, clean up a material or product catalog, check whether "the same item was entered twice", find similar master-data records, generate synthetic sample material data with known duplicates for testing or demos, embed Postgres rows into pgvector via the pgx pipeline, or export a dataset of similar record pairs — even if they never say "dedup" or "entity resolution". Also covers running the packaged material-similarity SOP end-to-end (seed → embed → analyze → dataset) against any Ollama/OpenAI-compatible embedding endpoint.
 ---
 
 # Material similarity — SOP for finding duplicate/near-duplicate materials via embeddings
@@ -152,3 +152,4 @@ out of scope here: deterministic fingerprint pre-pass, auto-merge workflows.)
 - `scripts/embed_materials.sh` — env-overridden wrapper over `scripts/backfill_embedding.sh`
 - `scripts/find_similar_materials.sh` — pgvector pair scoring → JSONL dataset
 - `graphql/` — schema/query/resolver assets extended with `brand`/`part_no`/`spec`/`dims`
+- `evals/evals.json` — test prompts for exercising the full SOP
