@@ -1,0 +1,12 @@
+type Material {
+  mat_no: String!
+  name: String!
+  status: String
+  brand: String
+  part_no: String
+  spec: String
+  dims: String
+  sizes: [Size!]!
+  colorways: [Colorway!]!
+  features: [MaterialFeature!]!
+}

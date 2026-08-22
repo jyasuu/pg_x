@@ -53,10 +53,13 @@ for i in $(seq 1 20); do
 done
 
 echo "==> backfill-embedding: setting up schema directory"
+# Override the asset source to reuse this flow with different GraphQL
+# schema/queries/resolvers (e.g. skills/material-similarity/graphql).
+ASSETS_DIR="${PGX_ASSETS_DIR:-examples/graphql/pgx}"
 mkdir -p ~/.pgx/schema ~/.pgx/queries
-cp -r examples/graphql/pgx/schema/* ~/.pgx/schema/
-cp -r examples/graphql/pgx/queries/* ~/.pgx/queries/
-[ -f ~/.pgx/config.toml ] || cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
+cp -r "$ASSETS_DIR"/schema/* ~/.pgx/schema/
+cp -r "$ASSETS_DIR"/queries/* ~/.pgx/queries/
+[ -f ~/.pgx/config.toml ] || cp "$ASSETS_DIR"/config.toml ~/.pgx/config.toml
 
 echo "==> backfill-embedding: preparing vector + documents schema"
 psql "$PGURL" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
