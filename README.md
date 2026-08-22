@@ -194,6 +194,24 @@ pgx -U $DATABASE_URL replicate \
 
 The Kafka message key is set to `schema.table` so events naturally partition by table.
 
+### Downstream: NATS JetStream
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  nats \
+  --nats-url nats://localhost:4222 \
+  --nats-subject pgx.wal \
+  --nats-stream pgx-events \
+  --nats-create-stream
+```
+
+Each event is published to the subject and awaited until the server confirms
+persistence. NATS headers `pgx-op`, `pgx-schema`, `pgx-table`, `pgx-lsn` are
+injected automatically. `--nats-create-stream` provisions the JetStream stream
+if missing; the subject must be captured by a stream for persistence.
+
 ### Downstream: Parquet
 
 ```bash
@@ -432,6 +450,28 @@ pgx -U $DATABASE_URL listen \
   --brokers localhost:9092 \
   --topic pgx-notify \
   --mode simple
+```
+
+### Downstream: NATS JetStream
+
+```bash
+# Simple mode — fixed subject
+pgx -U $DATABASE_URL listen \
+  -C orders \
+  nats \
+  --nats-url nats://localhost:4222 \
+  --nats-subject pgx.notify \
+  --nats-stream pgx-events \
+  --nats-create-stream \
+  --mode simple
+
+# Contract mode — `meta.routing.nats_subject` overrides the destination
+# per-message; x-event-type / x-pg-channel / x-schema-version headers are set.
+pgx -U $DATABASE_URL listen \
+  -C orders \
+  nats \
+  --nats-subject events.default \
+  --mode contract
 ```
 
 ### Downstream: Webhook
@@ -927,6 +967,7 @@ src/
 │   ├── elasticsearch.rs           # ES downstream (replicate)
 │   ├── rabbitmq.rs
 │   ├── kafka.rs
+│   ├── nats.rs
 │   ├── webhook.rs
 │   └── shell.rs
 └── utils/
@@ -953,7 +994,7 @@ src/replication/decoder.rs         decode_pgoutput(data) → WalEvent
 src/commands/replicate.rs          filter (--table, --op) → log → forward
     │
     ▼
-stdout / shell / webhook / rabbitmq / kafka / parquet
+stdout / shell / webhook / rabbitmq / kafka / nats / parquet
 ```
 
 ---
@@ -966,7 +1007,7 @@ stdout / shell / webhook / rabbitmq / kafka / parquet
 | `rabbitmq` | ✅      | RabbitMQ downstream via `lapin`                      |
 | `webhook`  | ✅      | HTTP webhook downstream via `reqwest`                |
 | `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
-| `nats`     | ✅      | NATS JetStream consume source via `async-nats`       |
+| `nats`     | ✅      | NATS JetStream source + sink via `async-nats`        |
 | `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |
 | `kv`       | ✅      | Redis / Memcached key-value store sink               |
 | `parquet`  | ✅      | Parquet file output via `arrow` + `parquet`           |

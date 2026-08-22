@@ -109,6 +109,10 @@ pub struct RoutingSpec {
     #[serde(default)]
     pub webhook_headers: HashMap<String, String>,
 
+    // ── NATS JetStream ────────────────────────────────────────────────────────
+    /// Override the publish subject for this message only.
+    pub nats_subject: Option<String>,
+
     // ── Shell ─────────────────────────────────────────────────────────────────
     /// Extra environment variables injected when the shell command runs.
     #[serde(default)]

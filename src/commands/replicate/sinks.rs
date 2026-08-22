@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{ReplicateArgs, ReplicateDownstreamCommand, PGX_PAYLOAD};
-#[cfg(feature = "rabbitmq")]
+#[cfg(any(feature = "rabbitmq", feature = "nats"))]
 use super::{PGX_LSN, PGX_OP, PGX_SCHEMA, PGX_TABLE};
 use crate::utils::config::DownstreamSinkKind;
 
@@ -190,6 +190,31 @@ impl WalSink for KafkaWalSink {
     }
 }
 
+#[cfg(feature = "nats")]
+struct NatsWalSink {
+    nats: crate::downstream::delivery::nats::Nats,
+    subject: String,
+}
+
+#[cfg(feature = "nats")]
+#[async_trait::async_trait]
+impl WalSink for NatsWalSink {
+    fn name(&self) -> &str {
+        "nats"
+    }
+
+    async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for key in [PGX_OP, PGX_SCHEMA, PGX_TABLE, PGX_LSN] {
+            if let Some(val) = env.get(key) {
+                let header_key = key.to_lowercase().replace('_', "-");
+                headers.push((header_key, val.clone()));
+            }
+        }
+        self.nats.publish(&self.subject, &headers, event_json).await
+    }
+}
+
 struct NoopSink;
 
 #[async_trait::async_trait]
@@ -302,6 +327,18 @@ pub(crate) async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<A
             Ok(Arc::new(KafkaWalSink {
                 producer,
                 topic: a.topic.clone(),
+            }))
+        }
+
+        #[cfg(feature = "nats")]
+        ReplicateDownstreamCommand::Nats(a) => {
+            let nats = crate::downstream::delivery::nats::Nats::connect(&a.nats_url).await?;
+            if a.nats_create_stream {
+                nats.ensure_stream(&a.nats_stream, &a.nats_subject).await?;
+            }
+            Ok(Arc::new(NatsWalSink {
+                nats,
+                subject: a.nats_subject.clone(),
             }))
         }
 
@@ -435,6 +472,32 @@ pub(crate) async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Ar
                 anyhow::bail!("RabbitMQ sink requires 'rabbitmq' feature (lapin)");
             }
         }
+        DownstreamSinkKind::Nats {
+            url,
+            subject,
+            stream,
+            create_stream,
+            ..
+        } => {
+            #[cfg(feature = "nats")]
+            {
+                let url = url
+                    .clone()
+                    .unwrap_or_else(|| "nats://localhost:4222".to_string());
+                let subject = subject.clone().unwrap_or_else(|| "pgx.wal".to_string());
+                let nats = crate::downstream::delivery::nats::Nats::connect(&url).await?;
+                if create_stream.unwrap_or(false) {
+                    let stream = stream.clone().unwrap_or_else(|| "pgx-events".to_string());
+                    nats.ensure_stream(&stream, &subject).await?;
+                }
+                Ok(Arc::new(NatsWalSink { nats, subject }))
+            }
+            #[cfg(not(feature = "nats"))]
+            {
+                let _ = (url, subject, stream, create_stream);
+                anyhow::bail!("NATS sink requires 'nats' feature (async-nats)");
+            }
+        }
         DownstreamSinkKind::Elasticsearch { .. } => {
             anyhow::bail!("Elasticsearch sink is not supported for replication; use 'listen elasticsearch' instead");
         }
@@ -549,6 +612,13 @@ fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
             routing_key: params.get("routing_key").cloned(),
             mode: params.get("mode").cloned(),
         }),
+        "nats" => Ok(DownstreamSinkKind::Nats {
+            url: params.get("url").cloned(),
+            subject: params.get("subject").cloned(),
+            stream: params.get("stream").cloned(),
+            create_stream: params.get("create_stream").map(|v| v != "false"),
+            mode: None,
+        }),
         "parquet" => Ok(DownstreamSinkKind::Parquet {
             output_dir: params.get("output_dir").cloned(),
             max_rows: params.get("max_rows").and_then(|v| v.parse().ok()),
@@ -557,7 +627,7 @@ fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
         }),
         other => {
             anyhow::bail!(
-                "Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq, parquet"
+                "Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq, nats, parquet"
             );
         }
     }

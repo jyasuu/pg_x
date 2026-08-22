@@ -210,6 +210,19 @@ pub enum DownstreamSinkKind {
         /// Forward mode (simple or contract).
         mode: Option<String>,
     },
+    /// Forward events to NATS JetStream.
+    Nats {
+        /// NATS server URL.
+        url: Option<String>,
+        /// Publish subject.
+        subject: Option<String>,
+        /// JetStream stream the subject is captured by.
+        stream: Option<String>,
+        /// Create the stream if missing.
+        create_stream: Option<bool>,
+        /// Forward mode (simple or contract).
+        mode: Option<String>,
+    },
     /// Index documents into Elasticsearch.
     Elasticsearch {
         /// Elasticsearch URL (e.g. http://localhost:9200).

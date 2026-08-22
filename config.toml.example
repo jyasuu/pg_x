@@ -91,6 +91,14 @@ pretty = true
 # [[connections.local.replicate.additional_sinks]]
 # type = "webhook"
 # url = "https://hooks.example.com/events"
+#
+# Replicate WAL events into NATS JetStream:
+# [[connections.local.replicate.additional_sinks]]
+# type = "nats"
+# url = "nats://localhost:4222"
+# subject = "pgx.wal"
+# stream = "pgx-events"
+# create_stream = true
 
 [connections.staging]
 url = "postgres://user:pass@staging.host:5432/stagingdb"
@@ -112,6 +120,19 @@ description = "Staging"
 # url = "https://hooks.example.com/pgx"
 # mode = "contract"
 #
+# Forward NOTIFY events to NATS JetStream (listen):
+#
+# [connections.local.listen]
+# channels = ["orders"]
+#
+# [connections.local.listen.sink]
+# type = "nats"
+# url = "nats://localhost:4222"
+# subject = "pgx.notify"
+# stream = "pgx-events"
+# create_stream = true
+# mode = "contract"
+
 # [connections.prod.consume]
 # source = { type = "rabbitmq", amqp_url = "amqp://rabbitmq:5672/%2F", queue = "events" }
 # sink = { type = "elasticsearch", url = "http://es:9200", index = "alerts" }

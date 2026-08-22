@@ -244,6 +244,10 @@ pub enum ReplicateDownstreamCommand {
     #[cfg(feature = "kafka")]
     Kafka(KafkaArgs),
 
+    /// Forward events to NATS JetStream.
+    #[cfg(feature = "nats")]
+    Nats(NatsArgs),
+
     /// Apply WAL changes directly to a PostgreSQL target database.
     Postgres(PostgresArgs),
 
@@ -318,6 +322,21 @@ pub struct KafkaArgs {
     pub brokers: String,
     #[arg(long, default_value = "pgx-wal")]
     pub topic: String,
+}
+
+#[cfg(feature = "nats")]
+#[derive(Args)]
+pub struct NatsArgs {
+    #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
+    pub nats_url: String,
+    #[arg(long, default_value = "pgx.wal")]
+    pub nats_subject: String,
+    /// JetStream stream that captures the subject (used with --nats-create-stream).
+    #[arg(long, default_value = "pgx-events")]
+    pub nats_stream: String,
+    /// Create the stream if it does not exist.
+    #[arg(long)]
+    pub nats_create_stream: bool,
 }
 
 #[derive(Args)]

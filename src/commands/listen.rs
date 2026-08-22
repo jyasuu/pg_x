@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
+#[cfg(feature = "nats")]
+use crate::utils::config::merge_bool;
 use crate::utils::config::{
     merge_opt, merge_vec, ChannelFullBehavior, Connection, DownstreamSinkKind, ResolverConfig,
 };
@@ -54,6 +56,10 @@ pub enum DownstreamCommand {
     #[cfg(feature = "kafka")]
     Kafka(KafkaArgs),
 
+    /// Forward events to NATS JetStream
+    #[cfg(feature = "nats")]
+    Nats(NatsArgs),
+
     /// Forward events via HTTP webhook (POST)
     #[cfg(feature = "webhook")]
     Webhook(WebhookArgs),
@@ -90,6 +96,23 @@ pub struct KafkaArgs {
     pub brokers: String,
     #[arg(long, default_value = "pgx-notify")]
     pub topic: String,
+    #[arg(long, value_enum, default_value_t = ForwardMode::Simple)]
+    pub mode: ForwardMode,
+}
+
+#[cfg(feature = "nats")]
+#[derive(Args)]
+pub struct NatsArgs {
+    #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
+    pub nats_url: String,
+    #[arg(long, default_value = "pgx.notify")]
+    pub nats_subject: String,
+    /// JetStream stream that captures the subject (used with --nats-create-stream).
+    #[arg(long, default_value = "pgx-events")]
+    pub nats_stream: String,
+    /// Create the stream if it does not exist.
+    #[arg(long)]
+    pub nats_create_stream: bool,
     #[arg(long, value_enum, default_value_t = ForwardMode::Simple)]
     pub mode: ForwardMode,
 }
@@ -245,6 +268,33 @@ pub async fn run(
                     if let Some(t) = topic {
                         a.topic = t.clone();
                     }
+                    if let Some(m) = mode {
+                        if let Ok(fm) = m.parse::<ForwardMode>() {
+                            a.mode = fm;
+                        }
+                    }
+                }
+                #[cfg(feature = "nats")]
+                (
+                    DownstreamCommand::Nats(a),
+                    DownstreamSinkKind::Nats {
+                        url,
+                        subject,
+                        stream,
+                        create_stream,
+                        mode,
+                    },
+                ) => {
+                    if let Some(u) = url {
+                        a.nats_url = u.clone();
+                    }
+                    if let Some(s) = subject {
+                        a.nats_subject = s.clone();
+                    }
+                    if let Some(s) = stream {
+                        a.nats_stream = s.clone();
+                    }
+                    merge_bool(&mut a.nats_create_stream, *create_stream);
                     if let Some(m) = mode {
                         if let Ok(fm) = m.parse::<ForwardMode>() {
                             a.mode = fm;
@@ -504,6 +554,31 @@ async fn build_downstream(
                 ForwardMode::Contract => Ok(Arc::new(ContractKafkaDownstream::connect(
                     &a.brokers, &a.topic,
                 )?)),
+            }
+        }
+
+        #[cfg(feature = "nats")]
+        DownstreamCommand::Nats(a) => {
+            use crate::downstream::nats::nats::{ContractNatsDownstream, SimpleNatsDownstream};
+            match a.mode {
+                ForwardMode::Simple => Ok(Arc::new(
+                    SimpleNatsDownstream::connect(
+                        &a.nats_url,
+                        &a.nats_subject,
+                        &a.nats_stream,
+                        a.nats_create_stream,
+                    )
+                    .await?,
+                )),
+                ForwardMode::Contract => Ok(Arc::new(
+                    ContractNatsDownstream::connect(
+                        &a.nats_url,
+                        &a.nats_subject,
+                        &a.nats_stream,
+                        a.nats_create_stream,
+                    )
+                    .await?,
+                )),
             }
         }
 

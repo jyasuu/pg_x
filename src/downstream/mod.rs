@@ -5,6 +5,7 @@ pub mod delivery;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod kafka;
+pub mod nats;
 pub mod rabbitmq;
 pub mod shell;
 pub mod sink;

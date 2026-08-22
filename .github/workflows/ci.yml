@@ -170,6 +170,10 @@ jobs:
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_nats.sh
         timeout-minutes: 3
 
+      - name: Test listen NATS command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_listen_nats.sh
+        timeout-minutes: 3
+
       - name: Test consume KV command
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_kv.sh
 

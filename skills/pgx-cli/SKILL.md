@@ -97,6 +97,10 @@ headers injected automatically:
 **Kafka** — message key set to `schema.table` so events partition naturally by table (requires `--features kafka`):
 `kafka --brokers localhost:9092 --topic pgx-wal`
 
+**NATS (JetStream)** — publish to a subject and await the server's persistence ack, with
+`pgx-op`/`pgx-schema`/`pgx-table`/`pgx-lsn` headers injected automatically:
+`nats --nats-url nats://localhost:4222 --nats-subject pgx.wal --nats-stream pgx-events --nats-create-stream`
+
 **Parquet** — Hive-partitioned files per table (`schema/table/year=/month=/day=/part-*.parquet`), plus `_pgx_op`, `_pgx_lsn`, `_pgx_old` metadata columns:
 `parquet --output-dir ./wal_archive --max-rows 50000 --compression zstd`
 
@@ -166,6 +170,12 @@ Delivery is at-most-once (use `replicate` if you need exactly-once).
 > `NOT_FOUND - no exchange '<name>' in vhost '/'` if they don't exist.
 
 **Kafka**: `pgx -U $DATABASE_URL listen -C orders kafka --brokers localhost:9092 --topic pgx-notify --mode simple`
+
+**NATS (JetStream)**: `pgx -U $DATABASE_URL listen -C orders nats --nats-url nats://localhost:4222 --nats-subject pgx.notify --nats-stream pgx-events --nats-create-stream --mode simple`
+In contract mode, `meta.routing.nats_subject` overrides the destination subject
+per-message; `x-event-type` / `x-pg-channel` / `x-schema-version` headers are
+set automatically. Pair it with `consume --source nats` on the same stream for
+a full NOTIFY → JetStream → GraphQL → sink loop.
 
 **Webhook**: `pgx -U $DATABASE_URL listen -C alerts webhook --url https://example.com/hooks/alerts --header "Authorization=Bearer mytoken" --mode simple`
 
@@ -580,7 +590,7 @@ Exposed tools: `query`, `list_tables`, `describe_table`, `db_info`,
 | `kv`       | on      | Redis / Memcached sink                       |
 | `parquet`  | on      | Parquet file output                          |
 | `kafka`    | off     | Kafka downstream (needs system `librdkafka`) |
-| `nats`     | on      | NATS JetStream consume source                |
+| `nats`     | on      | NATS JetStream source + sink                 |
 | `tls`      | off     | TLS for the control-plane connection         |
 | `iceberg`  | off     | Apache Iceberg output (export + replicate)   |
 | `mcp`      | off     | MCP server mode                              |
