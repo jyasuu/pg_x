@@ -95,6 +95,9 @@ jsonwebtoken = { version = "10", optional = true }
 
 # Kafka - feature-gated (requires librdkafka system library)
 rdkafka = { version = "0.36", optional = true }
+
+# NATS (JetStream) - feature-gated, pure Rust (no system deps)
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "server_2_10", "server_2_11", "server_2_12", "ring", "nkeys"], optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 
@@ -106,11 +109,12 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 
 
 [features]
-default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv", "parquet", "embed"]
+default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv", "parquet", "embed", "nats"]
 excel = ["rust_xlsxwriter"]
 tls = ["tokio-postgres-rustls", "rustls", "tokio-rustls", "webpki-roots"]
 rabbitmq = ["lapin"]
 kafka = ["rdkafka"]
+nats = ["dep:async-nats"]
 webhook = ["dep:reqwest"]
 elasticsearch = ["dep:reqwest"]
 embed = ["dep:reqwest"]

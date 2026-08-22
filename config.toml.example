@@ -49,6 +49,13 @@ mode = "simple"
 # query = "OrderFull"
 # on_error = "strict"
 #
+# Consume from NATS JetStream with a durable consumer:
+#
+# [connections.local.consume]
+# source = { type = "nats", url = "nats://localhost:4222", stream = "pgx-events", consumer = "pgx-consume" }
+# sink = { type = "elasticsearch", url = "http://localhost:9200", index = "materials" }
+# query_mode = "contract"
+#
 # Consume and store in Redis:
 #
 # [connections.local.consume]

@@ -26,7 +26,7 @@ use crate::utils::signal::shutdown_signal;
 
 #[derive(Args)]
 pub struct ConsumeArgs {
-    /// Source type: rabbitmq or kafka
+    /// Source type: rabbitmq, kafka, or nats
     #[arg(long, value_enum, default_value_t = ConsumeSourceType::Rabbitmq)]
     pub source: ConsumeSourceType,
 
@@ -57,6 +57,27 @@ pub struct ConsumeArgs {
     pub topic: Option<String>,
     #[arg(long)]
     pub group_id: Option<String>,
+
+    // ── Source: NATS (JetStream) ──
+    /// NATS server URL.
+    #[arg(long, env = "NATS_URL")]
+    pub nats_url: Option<String>,
+    /// JetStream stream name.
+    #[arg(long)]
+    pub nats_stream: Option<String>,
+    /// Subject filter within the stream, if the stream covers more than one
+    /// subject (wildcards allowed).
+    #[arg(long)]
+    pub nats_subject: Option<String>,
+    /// Durable consumer name; survives restarts and reuses the consumer's
+    /// cursor instead of starting from the stream default.
+    #[arg(long)]
+    pub nats_consumer: Option<String>,
+    /// Create the stream (and durable consumer) on startup if missing —
+    /// dev/test convenience; off by default so prod does not silently create
+    /// infrastructure.
+    #[arg(long, default_value_t = false)]
+    pub nats_create_stream: bool,
 
     // ── Query ──
     /// Query mode: contract (name from message event_type) or simple (fixed --query)
@@ -156,6 +177,7 @@ pub struct ConsumeArgs {
 pub enum ConsumeSourceType {
     Rabbitmq,
     Kafka,
+    Nats,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -788,6 +810,28 @@ async fn build_consumer(args: &ConsumeArgs) -> Result<Arc<dyn Consumer>> {
         ConsumeSourceType::Kafka => {
             anyhow::bail!("Kafka consumer requires the 'kafka' feature")
         }
+
+        #[cfg(feature = "nats")]
+        ConsumeSourceType::Nats => {
+            let url = args.nats_url.as_deref().unwrap_or("nats://localhost:4222");
+            let stream = args.nats_stream.as_deref().unwrap_or("pgx-events");
+            let subject = args.nats_subject.as_deref();
+            let durable = args.nats_consumer.as_deref().unwrap_or("pgx-consume");
+            let c = crate::consumer::nats::nats::NatsConsumer::connect(
+                url,
+                stream,
+                subject,
+                durable,
+                args.nats_create_stream,
+            )
+            .await?;
+            Ok(Arc::new(c))
+        }
+
+        #[cfg(not(feature = "nats"))]
+        ConsumeSourceType::Nats => {
+            anyhow::bail!("NATS consumer requires the 'nats' feature")
+        }
     }
 }
 
@@ -899,6 +943,7 @@ pub async fn run(
         args.source = match cfg.source {
             ConsumeSourceKind::Rabbitmq { .. } => ConsumeSourceType::Rabbitmq,
             ConsumeSourceKind::Kafka { .. } => ConsumeSourceType::Kafka,
+            ConsumeSourceKind::Nats { .. } => ConsumeSourceType::Nats,
         };
         merge_source_config(&mut args, &cfg.source);
     }
@@ -1051,6 +1096,29 @@ fn merge_source_config(args: &mut ConsumeArgs, source: &ConsumeSourceKind) {
                 args.group_id = group_id.clone();
             }
         }
+        ConsumeSourceKind::Nats {
+            url,
+            stream,
+            subject,
+            consumer,
+            create_stream,
+        } => {
+            if args.nats_url.is_none() && url.is_some() {
+                args.nats_url = url.clone();
+            }
+            if args.nats_stream.is_none() && stream.is_some() {
+                args.nats_stream = stream.clone();
+            }
+            if args.nats_subject.is_none() && subject.is_some() {
+                args.nats_subject = subject.clone();
+            }
+            if args.nats_consumer.is_none() && consumer.is_some() {
+                args.nats_consumer = consumer.clone();
+            }
+            if !args.nats_create_stream && create_stream.unwrap_or(false) {
+                args.nats_create_stream = true;
+            }
+        }
     }
 }
 
@@ -1178,6 +1246,11 @@ mod effective_config_tests {
             brokers: None,
             topic: None,
             group_id: None,
+            nats_url: None,
+            nats_stream: None,
+            nats_subject: None,
+            nats_consumer: None,
+            nats_create_stream: false,
             query_mode: None,
             query: None,
             max_depth: None,

@@ -160,8 +160,15 @@ jobs:
           cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
           cat init.sql | docker exec -i ${{ job.services.postgres.id }} psql -U postgres -d postgres
 
+      - name: Start NATS with JetStream
+        run: docker run -d --name pgx-nats -p 4222:4222 nats:2-alpine -js
+
       - name: Test consume command
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume.sh
+
+      - name: Test consume NATS command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_nats.sh
+        timeout-minutes: 3
 
       - name: Test consume KV command
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_kv.sh

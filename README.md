@@ -470,7 +470,7 @@ In contract mode:
 
 ## consume — Message Broker → GraphQL → Sink
 
-Consume messages from a broker (RabbitMQ, Kafka), compose them through GraphQL
+Consume messages from a broker (RabbitMQ, Kafka, NATS), compose them through GraphQL
 with batched SQL resolvers, and forward the result to a sink. This enables a
 CDC → enrichment → indexed document pipeline.
 
@@ -491,7 +491,22 @@ pgx -U $DATABASE_URL consume \
   --topic pgx-events \
   --group-id pgx \
   --sink stdout
+
+# NATS JetStream (durable pull consumer)
+pgx -U $DATABASE_URL consume \
+  --source nats \
+  --nats-url nats://localhost:4222 \
+  --nats-stream pgx-events \
+  --nats-consumer pgx-consume \
+  --sink stdout
 ```
+
+> **NATS:** targets JetStream (not core NATS pub/sub — no persistence or acks
+> there). The stream and durable consumer must already exist unless
+> `--nats-create-stream` is passed; a durable `--nats-consumer` name reuses the
+> server-side cursor across restarts. `nack(requeue=true)` sends an immediate
+> Nak; retry backoff is governed by the consumer's `ack_wait`/`max_deliver`
+> config on the server.
 
 ### GraphQL Resolvers
 
@@ -951,6 +966,7 @@ stdout / shell / webhook / rabbitmq / kafka / parquet
 | `rabbitmq` | ✅      | RabbitMQ downstream via `lapin`                      |
 | `webhook`  | ✅      | HTTP webhook downstream via `reqwest`                |
 | `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
+| `nats`     | ✅      | NATS JetStream consume source via `async-nats`       |
 | `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |
 | `kv`       | ✅      | Redis / Memcached key-value store sink               |
 | `parquet`  | ✅      | Parquet file output via `arrow` + `parquet`           |

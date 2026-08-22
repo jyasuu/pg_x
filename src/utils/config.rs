@@ -296,6 +296,19 @@ pub enum ConsumeSourceKind {
         topic: Option<String>,
         group_id: Option<String>,
     },
+    Nats {
+        /// NATS server URL.
+        url: Option<String>,
+        /// JetStream stream name.
+        stream: Option<String>,
+        /// Subject filter within the stream (wildcards allowed).
+        subject: Option<String>,
+        /// Durable pull-consumer name; reuses the server-side cursor across
+        /// restarts.
+        consumer: Option<String>,
+        /// Create the stream (and durable consumer) if missing.
+        create_stream: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

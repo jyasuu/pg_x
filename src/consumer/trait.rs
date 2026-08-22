@@ -28,13 +28,14 @@ pub struct BrokerMessage {
 pub struct DeliveryTag(u64);
 
 impl DeliveryTag {
-    /// Wrap a broker-native tag that fits in a `u64` (e.g. an AMQP delivery tag).
-    #[cfg(any(feature = "kafka", feature = "rabbitmq", test))]
+    /// Wrap a broker-native tag that fits in a `u64` (e.g. an AMQP delivery tag
+    /// or a JetStream stream sequence).
+    #[cfg(any(feature = "kafka", feature = "rabbitmq", feature = "nats", test))]
     pub fn from_u64(tag: u64) -> Self {
         Self(tag)
     }
 
-    #[cfg(any(feature = "kafka", feature = "rabbitmq"))]
+    #[cfg(any(feature = "kafka", feature = "rabbitmq", feature = "nats"))]
     pub fn as_u64(&self) -> u64 {
         self.0
     }

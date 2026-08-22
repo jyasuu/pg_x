@@ -196,6 +196,11 @@ into a fully joined document before indexing it.
 
 **RabbitMQ**: `--source rabbitmq --amqp-url amqp://guest:guest@localhost:5672/%2F --queue pgx-events`
 **Kafka**: `--source kafka --brokers localhost:9092 --topic pgx-events --group-id pgx`
+**NATS (JetStream)**: `--source nats --nats-url nats://localhost:4222 --nats-stream pgx-events --nats-consumer pgx-consume`
+
+> **NATS prerequisite:** JetStream stream and durable consumer must exist
+> before pgx connects (`nats stream add` / `nats consumer add`), or pass
+> `--nats-create-stream` for local/dev convenience.
 
 > **RabbitMQ prerequisite:** The queue must exist before pgx connects. If
 > publishing via `listen` → RabbitMQ → `consume`, also create the exchange
@@ -575,6 +580,7 @@ Exposed tools: `query`, `list_tables`, `describe_table`, `db_info`,
 | `kv`       | on      | Redis / Memcached sink                       |
 | `parquet`  | on      | Parquet file output                          |
 | `kafka`    | off     | Kafka downstream (needs system `librdkafka`) |
+| `nats`     | on      | NATS JetStream consume source                |
 | `tls`      | off     | TLS for the control-plane connection         |
 | `iceberg`  | off     | Apache Iceberg output (export + replicate)   |
 | `mcp`      | off     | MCP server mode                              |
