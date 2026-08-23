@@ -740,6 +740,88 @@ matches `--embed-dim`. The row id comes from `--id-field`, else the message id
 | ---------------- | ---------------------------------------- | ------------------ |
 | `--vector-table` | pgvector table to upsert into            | `chunk_embeddings` |
 
+#### graphql-mutate
+
+Executes a configured SQL INSERT/UPDATE against a **second** Postgres database
+("DB B"), projecting fields of the composed document into the statement's
+positional parameters — the write-side counterpart of the read resolvers, which
+compose from DB A. Define the mutation in `~/.pgx/config.toml`:
+
+```toml
+[mutations.upsert_material]
+target_url = "postgres://user:pass@dbB:5432/warehouse"   # falls back to --mutate-target-url
+sql = """
+INSERT INTO materials_mirror (mat_no, name, description)
+VALUES ($1, $2, $3)
+ON CONFLICT (mat_no) DO UPDATE
+SET name = EXCLUDED.name, description = EXCLUDED.description
+"""
+params = ["mat_no", "name", "description"]   # doc fields bound to $1, $2, … in order
+```
+
+For multi-table writes set `statements` (instead of `sql`) — the list runs in
+**one transaction**, so DB B either reflects the whole document or nothing:
+
+```toml
+[mutations.sync_full]
+target_url = "postgres://user:pass@dbB:5432/warehouse"
+params = ["mat_no", "name", "spec", "sizes"]
+statements = [
+  "INSERT INTO materials_mirror (mat_no, name, description) VALUES ($1, $2, $3) ON CONFLICT (mat_no) DO UPDATE SET name = EXCLUDED.name",
+  "DELETE FROM sizes WHERE mat_no = $1",
+  "INSERT INTO sizes (mat_no, code, label) SELECT $1, e->>'code', e->>'label' FROM jsonb_array_elements($4::text::jsonb) AS e"
+]
+```
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink graphql-mutate \
+  --mutation upsert_material \
+  --mutate-target-url "postgres://user:pass@dbB:5432/warehouse"
+```
+
+Behavior and limits:
+
+- **Separate target connection.** DB B gets its own dedicated connection built
+  from the resolved URL; DB A stays read-only for composition. Mutations
+  sharing the same `target_url` share one connection.
+- **One mutation per message.** Each composed document runs exactly one
+  execution (or one transaction); there is no cross-message (multi-row)
+  batching.
+- **Transactions (`sql` vs `statements`).** Set exactly one: `sql` is a single
+  statement in autocommit; `statements = […]` wraps every message's writes in
+  one explicit transaction — all commit or none do, so a mid-list failure
+  leaves DB B untouched and redelivery starts clean. Each statement binds only
+  the params it references (a DELETE keyed on `$1` alone works inside a larger
+  param list).
+- **Param binding.** Fields are looked up at the top level of the composed
+  document. Strings, numbers, and booleans bind as their natural types;
+  arrays/objects bind as their JSON serialization. Cast JSON params with the
+  double form `$n::text::jsonb` (a bare `$n::jsonb` fails client-side for the
+  same reason postgres-vector uses `$2::text::vector`); when the server cannot
+  infer a parameter type, it is retried with the bound value's type. A missing
+  field fails the message (`mutation '<name>' missing field '<field>' …`)
+  rather than silently binding NULL.
+- **Errors are sink failures.** Constraint violations etc. follow the normal
+  error policy (lenient → requeue, strict → abort). In `statements` mode a
+  failure rolls back everything the message wrote so far before that policy
+  applies.
+- **Idempotency.** With `--idempotent` the session-level dedupe cache skips
+  redelivered messages, but it is per-process — write statements as upserts
+  (`ON CONFLICT`) plus a delete-before-insert for child rows, so a
+  crash-window redelivery overwrites instead of failing or duplicating.
+
+| Flag                  | Description                                        | Default |
+| --------------------- | -------------------------------------------------- | ------- |
+| `--mutation`          | Name of a `[mutations.<name>]` entry in config     | —       |
+| `--mutate-target-url` | Target Postgres URL when the mutation has no `target_url` | — |
+
+> **Fan-out ordering:** paired with other sinks via repeatable `--sink`, the
+> "list dependency first" rule applies — e.g. list `elasticsearch` before
+> `graphql-mutate` when DB B rows reference documents indexed into ES.
+
 #### Fan-out (repeatable `--sink`)
 
 `--sink` is repeatable. With more than one sink the composed document is

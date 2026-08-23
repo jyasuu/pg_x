@@ -42,3 +42,33 @@ batch_by = "mat_no"
 sql = "SELECT attr_name, attr_value FROM feature_attributes WHERE feature_id::text = ANY($1)"
 param = "id"
 batch_by = "id"
+
+# graphql-mutate sink: mirror composed documents into a second Postgres
+# database ("DB B"). Create the target first:
+#   createdb -h localhost -U postgres warehouse
+#   psql -h localhost -U postgres -d warehouse \
+#     -c "CREATE TABLE materials_mirror (mat_no TEXT PRIMARY KEY, name TEXT, description TEXT)"
+# Then run consume with:
+#   --sink graphql-mutate --mutation upsert_material
+# (or set sink = { type = "graphql-mutate", mutation = "upsert_material" } above)
+#
+# [mutations.upsert_material]
+# target_url = "postgres://postgres:postgres@localhost:5432/warehouse"
+# sql = """
+# INSERT INTO materials_mirror (mat_no, name, description)
+# VALUES ($1, $2, $3)
+# ON CONFLICT (mat_no) DO UPDATE
+# SET name = EXCLUDED.name, description = EXCLUDED.description
+# """
+# params = ["mat_no", "name", "spec"]   # fields of the composed document, bound to $1, $2, …
+#
+# Multi-table variant: statements (instead of sql) run in one transaction —
+# all-or-nothing. Each statement binds only the params it references.
+# [mutations.sync_full]
+# target_url = "postgres://postgres:postgres@localhost:5432/warehouse"
+# params = ["mat_no", "name", "sizes"]
+# statements = [
+#   "INSERT INTO materials_mirror (mat_no, name) VALUES ($1, $2) ON CONFLICT (mat_no) DO UPDATE SET name = EXCLUDED.name",
+#   "DELETE FROM sizes WHERE mat_no = $1",
+#   "INSERT INTO sizes (mat_no, code, label) SELECT $1, e->>'code', e->>'label' FROM jsonb_array_elements($3::text::jsonb) AS e"
+# ]

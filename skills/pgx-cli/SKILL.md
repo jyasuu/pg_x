@@ -260,6 +260,14 @@ Cache key = `{key_prefix}{value_of_key_field}`; if `key_field` is unset or
 missing from the doc, a random UUID suffix is used instead. `--ttl 0` (Redis
 only) means no expiry.
 
+**graphql-mutate** (write the composed document into a second Postgres "DB B"):
+define `[mutations.<name>]` in `~/.pgx/config.toml` (sql XOR statements +
+params + optional target_url), then `--sink graphql-mutate --mutation <name>`.
+Doc fields bind positionally to `$1…$n`; a missing field fails the message.
+`sql` is one autocommit statement; `statements = […]` runs in one transaction
+(all-or-nothing). Write statements as upserts (`ON CONFLICT`) since dedupe is
+per-process. See README ("graphql-mutate" under consume sinks) for details.
+
 ### Error handling
 
 `--on-error strict` aborts the consumer on the first resolver/composition

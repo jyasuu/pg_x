@@ -16,6 +16,11 @@ pub struct Config {
     /// Resolver mappings for GraphQL composition
     #[serde(default)]
     pub resolvers: HashMap<String, ResolverConfig>,
+
+    /// Named SQL mutations applied to a second Postgres database by the
+    /// `consume` `graphql-mutate` sink.
+    #[serde(default)]
+    pub mutations: HashMap<String, MutationConfig>,
 }
 
 /// Behavior when the notification channel is full.
@@ -66,6 +71,53 @@ pub struct ResolverConfig {
     pub batch_by: Option<String>,
     /// Optional named connection override (e.g. read replica)
     pub connection: Option<String>,
+}
+
+/// Configuration for a single mutation — SQL applied to a second Postgres
+/// database ("DB B") by the `consume` `graphql-mutate` sink. Fields of the
+/// composed document are bound to the statement's positional parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationConfig {
+    /// Target database URL; falls back to `--mutate-target-url`.
+    pub target_url: Option<String>,
+    /// Single SQL statement (INSERT/UPDATE) with positional $1…$n parameters,
+    /// executed in autocommit. Exactly one of `sql` / `statements`.
+    #[serde(default)]
+    pub sql: Option<String>,
+    /// Ordered statement list executed in ONE transaction (all-or-nothing).
+    /// Each statement sees the same $1…$n parameters. Exactly one of
+    /// `sql` / `statements`.
+    #[serde(default)]
+    pub statements: Option<Vec<String>>,
+    /// Document fields bound to the parameters, in order ($1, $2, …).
+    #[serde(default)]
+    pub params: Vec<String>,
+}
+
+impl MutationConfig {
+    /// The statements to execute, regardless of which config form was used.
+    pub fn statement_list(&self) -> &[String] {
+        match &self.statements {
+            Some(stmts) => stmts,
+            None => match &self.sql {
+                Some(sql) => std::slice::from_ref(sql),
+                None => &[],
+            },
+        }
+    }
+
+    /// Exactly one of `sql` / `statements` must be set.
+    pub fn validate(&self) -> Result<()> {
+        match (&self.sql, &self.statements) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("mutation config must set either 'sql' or 'statements', not both")
+            }
+            (None, None) => {
+                anyhow::bail!("mutation config needs 'sql' or 'statements'")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -356,6 +408,16 @@ pub enum ConsumeSinkKind {
         /// Table name (default `chunk_embeddings`).
         table: Option<String>,
     },
+    /// Execute a named mutation's SQL against a second Postgres database,
+    /// binding composed-document fields to positional parameters.
+    GraphqlMutate {
+        /// Name of the `[mutations.<name>]` entry in ~/.pgx/config.toml
+        /// (falls back to `--mutation`).
+        mutation: Option<String>,
+        /// Target database URL override (e.g. `--mutate-target-url`); used
+        /// only when the mutation has no target_url of its own.
+        target_url: Option<String>,
+    },
 }
 
 /// Embedding-stage options for the `consume` command.
@@ -582,6 +644,57 @@ mod tests {
             back,
             DownstreamSinkKind::Stdout { pretty: Some(true) }
         ));
+    }
+
+    #[test]
+    fn mutation_config_toml_roundtrip_and_defaults() {
+        let toml_str = r#"
+        target_url = "postgres://user:pass@dbB:5432/warehouse"
+        sql = "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b"
+        params = ["mat_no", "name"]
+        "#;
+        let m: MutationConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            m.target_url.as_deref(),
+            Some("postgres://user:pass@dbB:5432/warehouse")
+        );
+        assert_eq!(m.params, vec!["mat_no".to_string(), "name".to_string()]);
+        m.validate().expect("valid");
+        assert_eq!(m.statement_list().len(), 1);
+
+        // params is optional; target_url falls back at runtime.
+        let minimal: MutationConfig = toml::from_str("sql = \"SELECT 1\"").expect("deserialize");
+        assert_eq!(minimal.target_url, None);
+        assert!(minimal.params.is_empty());
+    }
+
+    #[test]
+    fn mutation_config_transactional_statements() {
+        let toml_str = r#"
+        statements = [
+          "DELETE FROM sizes_mirror WHERE mat_no = $1",
+          "INSERT INTO sizes_mirror SELECT $1, e->>'size_code' FROM jsonb_array_elements($2::text::jsonb) e"
+        ]
+        params = ["mat_no", "sizes"]
+        "#;
+        let m: MutationConfig = toml::from_str(toml_str).expect("deserialize");
+        m.validate().expect("valid");
+        assert_eq!(m.statement_list().len(), 2);
+    }
+
+    #[test]
+    fn mutation_config_sql_xor_statements() {
+        let both: MutationConfig =
+            toml::from_str("sql = \"SELECT 1\"\nstatements = [\"SELECT 2\"]").expect("deserialize");
+        assert!(both.validate().is_err());
+
+        let neither = MutationConfig {
+            target_url: None,
+            sql: None,
+            statements: None,
+            params: vec![],
+        };
+        assert!(neither.validate().is_err());
     }
 
     // ── ChannelFullBehavior tests ───────────────────────────────────────────

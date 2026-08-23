@@ -15,5 +15,6 @@ Single-context repo. One glossary, shared by the engineering skills and the code
 - **shared progress** — `SharedProgress`, the monotonic applied-LSN (last received `end_lsn`) the stream loop updates and the client reads to send standby feedback.
 - **qualified name** — a table's `schema.table` name, produced by the single `qualified_name` helper; used for filters, file names, and table lookup.
 - **wal env keys** — the typed `PGX_*` constants (`PGX_OP`, `PGX_SCHEMA`, `PGX_TABLE`, `PGX_LSN`, `PGX_PAYLOAD`, …) that pass WAL event fields to child processes and sinks.
-- **sink** — an adapter that receives a fully composed GraphQL document (`ConsumeSink::send(doc, msg_id)`). Implements: stdout, elasticsearch, webhook, kv.
+- **sink** — an adapter that receives a fully composed GraphQL document (`ConsumeSink::send(doc, msg_id)`). Implements: stdout, elasticsearch, webhook, kv, postgres-vector, graphql-mutate.
+- **mutation** — a named `[mutations.<name>]` config entry (`MutationConfig`: target_url, sql XOR statements, params) the `graphql-mutate` sink executes against a second Postgres database, binding composed-document fields to `$1…$n`. `sql` is a single autocommit statement; `statements = […]` runs in one transaction (all-or-nothing multi-table writes).
 - **composition** — turning a message into a GraphQL document by resolving named queries against PostgreSQL.

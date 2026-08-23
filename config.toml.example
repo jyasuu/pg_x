@@ -13,6 +13,29 @@ default = "local"
 # batch_by = "mat_no"
 # connection = "staging"
 
+# Named SQL mutations for the `consume` graphql-mutate sink — write the
+# composed document into a second Postgres database ("DB B").
+# [mutations.upsert_material]
+# target_url = "postgres://user:pass@dbB:5432/warehouse"   # falls back to --mutate-target-url
+# sql = """
+# INSERT INTO materials_mirror (mat_no, name, description)
+# VALUES ($1, $2, $3)
+# ON CONFLICT (mat_no) DO UPDATE
+# SET name = EXCLUDED.name, description = EXCLUDED.description
+# """
+# params = ["mat_no", "name", "description"]   # doc fields bound to $1, $2, … in order
+
+# Multi-table writes run in one transaction (all statements commit or none do).
+# Set either sql OR statements; each statement binds only the params it uses.
+# [mutations.sync_full]
+# target_url = "postgres://user:pass@dbB:5432/warehouse"
+# params = ["mat_no", "name", "sizes"]
+# statements = [
+#   "INSERT INTO materials_mirror (mat_no, name) VALUES ($1, $2) ON CONFLICT (mat_no) DO UPDATE SET name = EXCLUDED.name",
+#   "DELETE FROM sizes WHERE mat_no = $1",
+#   "INSERT INTO sizes (mat_no, code, label) SELECT $1, e->>'code', e->>'label' FROM jsonb_array_elements($3::text::jsonb) AS e"
+# ]
+
 [connections.local]
 url = "postgres://postgres:secret@localhost:5432/mydb"
 description = "Local dev database"

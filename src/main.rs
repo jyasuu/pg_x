@@ -144,7 +144,9 @@ async fn main() -> Result<()> {
         Commands::Listen(args) => listen::run(url, args, conn, cli.tls, &cfg.resolvers).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
         Commands::Psql(args) => psql::run(url, args),
-        Commands::Consume(args) => consume::run(url, *args, conn, cli.tls, &cfg.resolvers).await,
+        Commands::Consume(args) => {
+            consume::run(url, *args, conn, cli.tls, &cfg.resolvers, &cfg.mutations).await
+        }
         Commands::Graphql(args) => {
             commands::graphql::run(url, args, conn_name.as_deref(), cli.tls).await
         }
